@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# ExecuTorch source checkout and native build trees.
+# `delegate-doctor setup-android` recreates these from a pinned commit.
+.build/
+
+# Cross-compiled Arm64 runner binaries.
+# `delegate-doctor setup-android` builds these; they are too large to commit.
+runners/*
+!runners/.gitkeep
+
+# Per-run output: .pte files, ETDump traces, profiles, reports.
+artifacts/*
+!artifacts/.gitkeep
+
+# Machine-generated run results. The checked-in example_run.txt is kept as
+# evidence of a previously measured run.
+results/*
+!results/.gitkeep
+!results/example_run.txt

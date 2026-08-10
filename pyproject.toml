@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delegate-doctor"
+version = "0.1.0"
+description = "Find and repair expensive ExecuTorch/XNNPACK fallback operations on Arm64"
+readme = "README.md"
+license = { file = "LICENSE" }
+
+# Python 3.12 only. The whole project was developed and validated on 3.12.7,
+# and the upper bound is deliberate: on newer interpreters the ExecuTorch and
+# PyTorch stack emits compatibility warnings we have not investigated. A hard
+# bound gives a clear pip error instead of a subtly different environment.
+requires-python = ">=3.12,<3.13"
+
+# Pinned to the exact stack this project was validated against.
+#   executorch 1.4.0 pulls torch 2.13.0 itself.
+#   torchvision and segmentation_models_pytorch are needed by the built-in
+#   `delegate-doctor doctor unet` demo. They are ordinary dependencies rather
+#   than an optional extra so that the documented install path is enough to run
+#   the primary demonstration without hunting down a ModuleNotFoundError.
+dependencies = [
+    "executorch==1.4.0",
+    "torchvision==0.28.0",
+    "segmentation_models_pytorch==0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+delegate-doctor = "delegate_doctor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["delegate_doctor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
