@@ -24,6 +24,7 @@ import torch
 
 from . import (
     android_setup,
+    custom_model,
     benchmarking,
     delegation,
     device,
@@ -105,19 +106,20 @@ def next_run_directory(artifacts_dir: str) -> str:
         run_number += 1
 
 
-def save_input_for_device(input_tensor: torch.Tensor, run_dir: str) -> str:
-    """Write the benchmark input as a raw fp32 blob.
+def save_input_for_device(input_tensor: torch.Tensor, run_dir: str,
+                          index: int = 0) -> str:
+    """Write one input tensor as a raw fp32 blob.
 
-    `executor_runner --inputs` reads raw tensor data with no header, so the
-    same bytes feed both the before and after models.
+    `executor_runner --inputs` reads raw tensor data with no header, so the same
+    bytes feed the original and repaired models. One file per positional input.
     """
-    path = os.path.join(run_dir, "input.bin")
-    input_tensor.numpy().tofile(path)
+    path = os.path.join(run_dir, f"input{index}.bin")
+    input_tensor.detach().numpy().tofile(path)
     return path
 
 
-def run_doctor(
-    model_argument: str,
+def run_optimization(
+    model_spec,
     runners_dir: str,
     artifacts_dir: str,
     warmup_iterations: int,
@@ -125,9 +127,12 @@ def run_doctor(
     repetitions: int,
     threads: int,
     profile_iterations: int,
-    seed: int,
 ) -> int:
-    """Run the full workflow. Returns a process exit code."""
+    """The optimization pipeline, shared by `doctor` and `optimize`.
+
+    Both commands build a ModelSpec - one from the built-in catalog, one from a
+    user's Python file - and then run exactly this. There is only one pipeline.
+    """
     report_parts = []
 
     def emit(section: str) -> None:
@@ -145,12 +150,15 @@ def run_doctor(
     bench_runner = device.find_runner(runners_dir, device.BENCH_RUNNER_NAME)
     etdump_runner = device.find_runner(runners_dir, device.ETDUMP_RUNNER_NAME)
 
-    model_spec = load_model_spec(model_argument)
     run_dir = next_run_directory(artifacts_dir)
     before_dir = os.path.join(run_dir, "before")
     after_dir = os.path.join(run_dir, "after")
 
-    input_shape = "x".join(str(int(s)) for s in model_spec.example_inputs[0].shape)
+    # The spec's tensors are frozen for the whole run: export, host
+    # verification, device verification and the benchmark all see identical
+    # values. `example_inputs()` is never called twice.
+    frozen_inputs = model_spec.example_inputs
+    input_shape = custom_model.describe_inputs(frozen_inputs)
     emit(reporting.format_header(
         model_name=model_spec.name,
         input_shape=input_shape,
@@ -159,9 +167,21 @@ def run_doctor(
 
     # --- export and lower the original model -------------------------------
     print("\nExporting and lowering with XNNPACK...")
-    original_exported = export_model.export_to_aten(
-        model_spec.model, model_spec.example_inputs
-    )
+    try:
+        original_exported = export_model.export_to_aten(
+            model_spec.model, frozen_inputs
+        )
+    except Exception as error:
+        raise custom_model.CustomModelError(
+            f"EXPORT FAILED\n"
+            f"\n"
+            f"This model could not be exported with the supported stack.\n"
+            f"  Model:      {model_spec.name}\n"
+            f"  Python:     3.12\n"
+            f"  ExecuTorch: {android_setup.SUPPORTED_EXECUTORCH_VERSION}\n"
+            f"\n"
+            f"{type(error).__name__}: {str(error)[:900]}"
+        )
     # DD-001 mutates the graph, so keep an untouched copy for the "before" path.
     exported_for_repair = copy.deepcopy(original_exported)
 
@@ -171,16 +191,17 @@ def run_doctor(
     export_model.save_readable_graphs(before_export, before_dir)
     before_delegation = delegation.analyze_delegation(before_export.edge_program_manager)
 
-    # --- one deterministic input, shared by every measurement --------------
-    torch.manual_seed(seed)
-    benchmark_input = torch.randn(*model_spec.example_inputs[0].shape)
-    device_input_path = save_input_for_device(benchmark_input, run_dir)
+    # --- the same frozen inputs, staged for the device ---------------------
+    device_input_paths = [
+        save_input_for_device(tensor, run_dir, index)
+        for index, tensor in enumerate(frozen_inputs)
+    ]
 
     # --- profile the original on the device --------------------------------
     print("Profiling original on device...")
     before_profile = profiling.profile_model(
         pte_path=before_export.pte_path,
-        input_path=device_input_path,
+        input_path=device_input_paths[0],
         etdump_runner_path=etdump_runner,
         output_etdump_path=os.path.join(before_dir, "trace.etdump"),
         label="before",
@@ -206,9 +227,9 @@ def run_doctor(
     emit(reporting.format_hotspots(before_profile, repairable_kernels))
 
     if not applicable:
-        for rule, found in detections:
-            emit(reporting.format_detection(rule, found))
-        emit("\nNo known repair pattern found in this model. Nothing to repair.\n")
+        # Analysis succeeded; there is simply no rule for what it found. That is
+        # a useful result, not a tool failure, so this exits 0.
+        emit(reporting.format_no_repair(before_profile))
         reporting.write_text("\n".join(report_parts), os.path.join(run_dir, "report.txt"))
         print(f"Artifacts: {run_dir}")
         return 0
@@ -231,7 +252,7 @@ def run_doctor(
     print("Profiling repaired on device...")
     after_profile = profiling.profile_model(
         pte_path=after_export.pte_path,
-        input_path=device_input_path,
+        input_path=device_input_paths[0],
         etdump_runner_path=etdump_runner,
         output_etdump_path=os.path.join(after_dir, "trace.etdump"),
         label="after",
@@ -248,12 +269,12 @@ def run_doctor(
     # --- numerical gate ----------------------------------------------------
     print("Verifying on host...")
     with torch.no_grad():
-        eager_output = model_spec.model(benchmark_input)
+        eager_output = model_spec.model(*frozen_inputs)
     if isinstance(eager_output, (tuple, list)):
         eager_output = eager_output[0]
 
-    original_output = export_model.run_on_host(before_export.pte_path, (benchmark_input,))[0]
-    repaired_output = export_model.run_on_host(after_export.pte_path, (benchmark_input,))[0]
+    original_output = export_model.run_on_host(before_export.pte_path, frozen_inputs)[0]
+    repaired_output = export_model.run_on_host(after_export.pte_path, frozen_inputs)[0]
 
     verification_result = verify_repair(
         original_output=original_output,
@@ -271,7 +292,7 @@ def run_doctor(
         device_result = device_verification.run_device_verification(
             before_pte_path=before_export.pte_path,
             after_pte_path=after_export.pte_path,
-            input_path=device_input_path,
+            input_paths=device_input_paths,
             bench_runner_path=bench_runner,
             original_host_output=original_output,
             repaired_host_output=repaired_output,
@@ -301,7 +322,7 @@ def run_doctor(
     benchmark_result = benchmarking.benchmark_before_after(
         before_pte_path=before_export.pte_path,
         after_pte_path=after_export.pte_path,
-        input_path=device_input_path,
+        input_paths=device_input_paths,
         bench_runner_path=bench_runner,
         device_info=device_info,
         warmup_iterations=warmup_iterations,
@@ -364,14 +385,37 @@ def _quieten_known_upstream_warnings() -> None:
     )
 
 
+def run_doctor(model_argument: str, seed: int, **pipeline_options) -> int:
+    """Built-in demo workflow: build a catalog model, then optimize it."""
+    torch.manual_seed(seed)
+    return run_optimization(load_model_spec(model_argument), **pipeline_options)
+
+
+def run_optimize(model_file: str, **pipeline_options) -> int:
+    """Custom workflow: load the user's Python file, then optimize it.
+
+    Everything after the model and inputs exist is identical to `doctor`.
+    """
+    model_spec = custom_model.load(model_file)
+    return run_optimization(model_spec, **pipeline_options)
+
+
 def main(argv: Optional[list] = None) -> int:
     _quieten_known_upstream_warnings()
     parser = argparse.ArgumentParser(
         prog="delegate-doctor",
         description=(
             "Find and repair expensive ExecuTorch/XNNPACK fallback operations, "
-            "then keep the repair only if it is correct and faster on Arm64."
+            "then keep the repair only if it is correct and faster on Arm64.\n"
+            "\n"
+            "  doctor MODEL         run a built-in example\n"
+            "  optimize MODEL_FILE  optimize your own model (must define\n"
+            "                       create_model() and example_inputs())\n"
+            "\n"
+            "`optimize` executes the Python file you give it - only use files "
+            "you trust."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -402,6 +446,26 @@ def main(argv: Optional[list] = None) -> int:
     doctor.add_argument("--seed", type=int, default=1234,
                         help="seed for the deterministic benchmark input")
 
+    optimize = subparsers.add_parser(
+        "optimize",
+        help="optimize your own PyTorch model from a Python file",
+        description=(
+            "Optimize a custom PyTorch model. The file must define "
+            "create_model() returning a torch.nn.Module and example_inputs() "
+            "returning a tuple of positional fp32 tensors. "
+            "NOTE: the file is imported and executed, so only use files you trust."
+        ),
+    )
+    optimize.add_argument("model_file", metavar="MODEL_FILE",
+                          help="path to a .py file defining create_model() and example_inputs()")
+    optimize.add_argument("--runners-dir", default=DEFAULT_RUNNERS_DIR)
+    optimize.add_argument("--artifacts-dir", default=DEFAULT_ARTIFACTS_DIR)
+    optimize.add_argument("--warmup", type=int, default=20)
+    optimize.add_argument("--iters", type=int, default=150)
+    optimize.add_argument("--reps", type=int, default=3)
+    optimize.add_argument("--threads", type=int, default=4)
+    optimize.add_argument("--profile-iters", type=int, default=20)
+
     setup = subparsers.add_parser(
         "setup-android",
         help="download the pinned ExecuTorch source and build the Arm64 runners",
@@ -427,19 +491,23 @@ def main(argv: Optional[list] = None) -> int:
             print(f"\n{error}", file=sys.stderr)
             return 2
 
-    if args.command == "doctor":
+    if args.command in ("doctor", "optimize"):
+        pipeline_options = dict(
+            runners_dir=args.runners_dir,
+            artifacts_dir=args.artifacts_dir,
+            warmup_iterations=args.warmup,
+            measured_iterations=args.iters,
+            repetitions=args.reps,
+            threads=args.threads,
+            profile_iterations=args.profile_iters,
+        )
         try:
-            return run_doctor(
-                model_argument=args.model,
-                runners_dir=args.runners_dir,
-                artifacts_dir=args.artifacts_dir,
-                warmup_iterations=args.warmup,
-                measured_iterations=args.iters,
-                repetitions=args.reps,
-                threads=args.threads,
-                profile_iterations=args.profile_iters,
-                seed=args.seed,
-            )
+            if args.command == "doctor":
+                return run_doctor(args.model, seed=args.seed, **pipeline_options)
+            return run_optimize(args.model_file, **pipeline_options)
+        except custom_model.CustomModelError as error:
+            print(f"\n{error}", file=sys.stderr)
+            return 2
         except device.DeviceError as error:
             print(f"\nDevice error:\n{error}", file=sys.stderr)
             return 2

@@ -113,6 +113,26 @@ def format_detection(rule, detection_result) -> str:
     return text
 
 
+def format_no_repair(profile_result) -> str:
+    """The model was analysed fine, but no catalog rule matches what it uses.
+
+    This is a successful outcome, not an error: the unrepaired hotspots are the
+    raw material for a future repair rule.
+    """
+    text = _heading("NO REPAIR AVAILABLE")
+    if not profile_result.portable_kernels:
+        text += ("\nNothing to repair - all measured runtime is already inside "
+                 "XNNPACK.\n")
+        return text
+    text += "\nNo verified repair matches this model. Unrepaired fallbacks:\n"
+    for kernel in profile_result.portable_kernels[:5]:
+        text += (f"  {kernel.operator_name} · {kernel.total_ms:.1f} ms · "
+                 f"{_percent(kernel.runtime_fraction)} runtime · no known repair\n")
+    text += ("\nThese are candidates for a future repair rule. The model was "
+             "analysed successfully;\nno repaired artifact was produced.\n")
+    return text
+
+
 def format_repair(rule, repaired_count: int) -> str:
     return f"Repair: {rule.describe_rewrite()}  ({repaired_count} site(s))\n"
 

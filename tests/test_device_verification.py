@@ -165,12 +165,12 @@ def test_capture_uses_the_selected_serial_and_unique_names(tmp_path, monkeypatch
     fake.install(monkeypatch)
 
     before = capture_device_output(
-        pte_path="before.pte", input_path="input.bin",
+        pte_path="before.pte", input_paths=["input.bin"],
         bench_runner_path="runners/executor_runner_bench",
         label="before", output_dir=str(tmp_path), serial="emulator-5554",
     )
     after = capture_device_output(
-        pte_path="after.pte", input_path="input.bin",
+        pte_path="after.pte", input_paths=["input.bin"],
         bench_runner_path="runners/executor_runner_bench",
         label="after", output_dir=str(tmp_path), serial="emulator-5554",
     )
@@ -201,7 +201,7 @@ def test_capture_pushes_the_same_input_for_both_models(tmp_path, monkeypatch):
 
     for label in ("before", "after"):
         capture_device_output(
-            pte_path=f"{label}.pte", input_path="shared_input.bin",
+            pte_path=f"{label}.pte", input_paths=["shared_input.bin"],
             bench_runner_path="bench", label=label,
             output_dir=str(tmp_path), serial="emulator-5554",
         )
@@ -216,7 +216,7 @@ def test_capture_runs_exactly_one_iteration_and_prints_no_tensors(tmp_path, monk
     fake.install(monkeypatch)
 
     capture_device_output(
-        pte_path="before.pte", input_path="input.bin", bench_runner_path="bench",
+        pte_path="before.pte", input_paths=["input.bin"], bench_runner_path="bench",
         label="before", output_dir=str(tmp_path), serial="emulator-5554",
     )
 
@@ -232,7 +232,7 @@ def test_missing_device_output_is_reported_with_both_paths(tmp_path, monkeypatch
 
     with pytest.raises(DeviceVerificationError) as caught:
         capture_device_output(
-            pte_path="before.pte", input_path="input.bin", bench_runner_path="bench",
+            pte_path="before.pte", input_paths=["input.bin"], bench_runner_path="bench",
             label="before", output_dir=str(tmp_path), serial="emulator-5554",
         )
     message = str(caught.value)
@@ -351,7 +351,7 @@ def test_run_device_verification_end_to_end(tmp_path, monkeypatch):
     result = run_device_verification(
         before_pte_path="before.pte",
         after_pte_path="after.pte",
-        input_path="input.bin",
+        input_paths=["input.bin"],
         bench_runner_path="bench",
         original_host_output=host_original,
         repaired_host_output=host_repaired,
@@ -373,7 +373,7 @@ def test_result_serializes_for_the_run_artifacts(tmp_path, monkeypatch):
     fake.install(monkeypatch)
 
     result = run_device_verification(
-        before_pte_path="b.pte", after_pte_path="a.pte", input_path="i.bin",
+        before_pte_path="b.pte", after_pte_path="a.pte", input_paths=["i.bin"],
         bench_runner_path="bench", original_host_output=host,
         repaired_host_output=host, output_dir=str(tmp_path),
         serial="emulator-5554", argmax_dim=1,

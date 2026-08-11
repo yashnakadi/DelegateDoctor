@@ -171,7 +171,7 @@ def run_one_pass(
 def benchmark_before_after(
     before_pte_path: str,
     after_pte_path: str,
-    input_path: str,
+    input_paths,
     bench_runner_path: str,
     device_info: device.DeviceInfo,
     warmup_iterations: int = 20,
@@ -193,12 +193,17 @@ def benchmark_before_after(
     # basename (before/model.pte and after/model.pte), so pushing them under
     # their basenames would silently overwrite one with the other and benchmark
     # the same program twice.
+    if isinstance(input_paths, str):
+        input_paths = [input_paths]
     remote_before = "before_model.pte"
     remote_after = "after_model.pte"
-    remote_input = "benchmark_input.bin"
     device.push_file(before_pte_path, remote_before, serial=serial)
     device.push_file(after_pte_path, remote_after, serial=serial)
-    device.push_file(input_path, remote_input, serial=serial)
+    # One file per positional input; executor_runner takes them comma-separated.
+    remote_input = ",".join(
+        os.path.basename(device.push_file(local, f"benchmark_input{i}.bin", serial=serial))
+        for i, local in enumerate(input_paths)
+    )
 
     total_iterations = warmup_iterations + measured_iterations
     before_samples: List[float] = []

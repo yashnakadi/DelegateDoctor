@@ -193,6 +193,63 @@ avdmanager create avd -n dd_arm64 -k "system-images;android-35;google_apis;arm64
 adb wait-for-device
 ```
 
+### Optimize your own model
+
+Point DelegateDoctor at any PyTorch model — it does not need to know the model:
+
+```python
+# my_model.py
+import torch
+from my_project import MyModel
+
+
+def create_model():
+    model = MyModel()
+    # load your own weights here if you have them
+    model.eval()
+    return model
+
+
+def example_inputs():
+    return (torch.randn(1, 3, 256, 256),)
+```
+
+```bash
+delegate-doctor optimize my_model.py
+```
+
+DelegateDoctor imports the file, exports the model, profiles it on your Android
+target, matches it against the repair catalog, verifies the repaired outputs on
+host **and** device, benchmarks before/after, and keeps the repair only if it is
+faster on *your* device.
+
+The contract is two functions and nothing else — no flags, no config, no
+metadata. You own weight loading; DelegateDoctor receives a constructed model.
+
+> **The file is imported and executed.** There is no sandbox. Only run
+> `optimize` on model files you trust.
+
+Requirements and current limits:
+
+- Python 3.12, static shapes, **fp32** inputs (other dtypes are rejected, never
+  silently converted)
+- positional tensor inputs only (no kwargs)
+- device verification reads back the **first output tensor**, so the model must
+  return a tensor, or a tuple whose first element is one
+- custom models report tensor error only — no argmax/top-1 claim is made,
+  because DelegateDoctor does not know your output semantics
+- a supported Arm64 Android target, same as `doctor`
+
+If the catalog has no rule for your model, that is a **successful analysis**,
+not a failure: the unrepaired hotspots are listed as candidates for a future
+repair rule, and the command exits 0.
+
+Try it on the bundled example, which is treated exactly like any external file:
+
+```bash
+delegate-doctor optimize examples/custom_model.py
+```
+
 ### Run DelegateDoctor
 
 ```bash
@@ -330,6 +387,35 @@ The repaired model is numerically correct and achieves a 2.93x speedup
 Each run also writes `artifacts/run_NNN/` containing both `.pte` files, readable
 graphs, ETDump traces, profiles, `verification.json`, `benchmark.json`,
 `results.json` and `report.txt`.
+
+## How it fits together
+
+```
+Your model  (my_model.py)
+    |
+    v
+DelegateDoctor  ->  export  ->  XNNPACK partition  ->  profile on device
+    |
+    v
+Repair catalog
+  |- DD-001  non-last-dimension softmax
+  |- DD-002  redundant no-op alias
+  `- future community repairs
+    |
+    v
+host + Android verification
+    |
+    v
+benchmark on YOUR target
+    |
+    v
+optimized .pte  (kept only if correct and faster)
+```
+
+A repair rule is a **known safe optimization candidate, not a promise of
+universal speedup.** DelegateDoctor benchmarks every repair on your actual
+target before accepting it — the same bit-exact DD-002 repair measured 1.46x on
+one Arm64 target and was un-measurable on another.
 
 ## Repair catalog
 

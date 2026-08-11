@@ -334,17 +334,7 @@ def apply(exported_program: ExportedProgram) -> int:
 
 def describe_rewrite() -> str:
     """The before/after shown in the terminal report."""
-    return (
-        "Original:\n"
-        "softmax(dim=D)\n"
-        "\n"
-        "Rewritten:\n"
-        "view\n"
-        "-> permute\n"
-        "-> softmax(dim=-1)\n"
-        "-> permute\n"
-        "-> view"
-    )
+    return "softmax(dim=D) -> view -> permute -> softmax(dim=-1) -> permute -> view"
 
 
 def matches_portable_kernel(kernel_name: str) -> bool:

@@ -159,7 +159,7 @@ def write_spec_sidecar(spec: TensorSpec, path: str) -> str:
 
 def capture_device_output(
     pte_path: str,
-    input_path: str,
+    input_paths,
     bench_runner_path: str,
     label: str,
     output_dir: str,
@@ -174,13 +174,20 @@ def capture_device_output(
     device.prepare_work_dir(serial=serial)
     device.push_runner(bench_runner_path, serial=serial)
 
+    if isinstance(input_paths, str):
+        input_paths = [input_paths]
     remote_pte = f"{label}_verify_model.pte"
-    remote_input = f"{label}_verify_input.bin"
     remote_output_base = f"{label}_output"
     remote_output_file = f"{remote_output_base}-{FIRST_OUTPUT_INDEX}.bin"
 
     device.push_file(pte_path, remote_pte, serial=serial)
-    device.push_file(input_path, remote_input, serial=serial)
+    # executor_runner takes a comma-separated list, one file per positional input.
+    remote_inputs = []
+    for index, local_input in enumerate(input_paths):
+        remote_name = f"{label}_verify_input{index}.bin"
+        device.push_file(local_input, remote_name, serial=serial)
+        remote_inputs.append(remote_name)
+    remote_input = ",".join(remote_inputs)
     # Remove any stale file so a failed run cannot be mistaken for a fresh one.
     device.remove_remote_files(f"{remote_output_base}-*.bin", serial=serial)
 
@@ -352,7 +359,7 @@ def verify_device_outputs(
 def run_device_verification(
     before_pte_path: str,
     after_pte_path: str,
-    input_path: str,
+    input_paths,
     bench_runner_path: str,
     original_host_output: torch.Tensor,
     repaired_host_output: torch.Tensor,
@@ -367,7 +374,7 @@ def run_device_verification(
 
     original_path = capture_device_output(
         pte_path=before_pte_path,
-        input_path=input_path,
+        input_paths=input_paths,
         bench_runner_path=bench_runner_path,
         label="before",
         output_dir=output_dir,
@@ -376,7 +383,7 @@ def run_device_verification(
     )
     repaired_path = capture_device_output(
         pte_path=after_pte_path,
-        input_path=input_path,
+        input_paths=input_paths,
         bench_runner_path=bench_runner_path,
         label="after",
         output_dir=output_dir,
