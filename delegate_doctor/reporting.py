@@ -64,9 +64,12 @@ def format_analysis(delegation_report, profile_result) -> str:
     return text
 
 
-def format_hotspots(profile_result, repairable_kernel_names: List[str],
-                    limit: int = 3) -> str:
-    """Portable kernels ranked by measured cost, most expensive first."""
+def format_hotspots(profile_result, repairable_kernels, limit: int = 3) -> str:
+    """Portable kernels ranked by measured cost, most expensive first.
+
+    `repairable_kernels` maps a kernel name to the rule id that repairs it, so
+    the hotspot list says which rule applies rather than just "available".
+    """
     text = _heading("HOTSPOTS")
     if not profile_result.portable_kernels:
         text += "\nNone. All measured runtime is inside XNNPACK.\n"
@@ -74,8 +77,8 @@ def format_hotspots(profile_result, repairable_kernel_names: List[str],
 
     text += "\n"
     for position, kernel in enumerate(profile_result.portable_kernels[:limit], start=1):
-        repair = ("DD-001 available" if kernel.name in repairable_kernel_names
-                  else "no repair rule")
+        rule_id = repairable_kernels.get(kernel.name)
+        repair = f"{rule_id} available" if rule_id else "no repair rule"
         text += (
             f"{position}. {kernel.operator_name} · {kernel.total_ms:.1f} ms · "
             f"{_percent(kernel.runtime_fraction)} runtime · "
@@ -87,12 +90,12 @@ def format_hotspots(profile_result, repairable_kernel_names: List[str],
     return text
 
 
-def format_detection(detection_result) -> str:
-    """What DD-001 found. One line per site."""
-    text = _heading("DD-001  non-last-dimension softmax")
+def format_detection(rule, detection_result) -> str:
+    """What one rule found. One line per site."""
+    text = _heading(f"{rule.RULE_ID}  {rule.RULE_TITLE}")
     if not detection_result.detections:
         if not detection_result.skipped:
-            text += "\nNo softmax operations found in this graph.\n"
+            text += "\nNot found in this graph.\n"
         else:
             text += "\nNot applicable:\n"
             for skipped in detection_result.skipped:
@@ -100,23 +103,18 @@ def format_detection(detection_result) -> str:
         return text
 
     text += "\n"
+    # A rule with many identical sites prints a count instead of a wall of lines.
+    if len(detection_result.detections) > 3:
+        first = detection_result.detections[0]
+        text += (f"{len(detection_result.detections)} sites, e.g. {first.explain()}\n")
+        return text
     for detection in detection_result.detections:
-        text += (
-            f"{detection.node_name}: softmax(dim={detection.softmax_dim}) on "
-            f"{list(detection.input_shape)} · rank {detection.tensor_rank} · "
-            f"last dim {detection.last_dim}\n"
-            f"  access: {detection.vector_count:,} vectors x "
-            f"{detection.vector_length} classes, stride "
-            f"{detection.element_stride:,}\n"
-        )
+        text += detection.explain() + "\n"
     return text
 
 
-def format_repair(rewrite_description: str, repaired_count: int) -> str:
-    return (
-        f"\nRepair: view -> permute -> softmax(dim=-1) -> permute -> view"
-        f"  ({repaired_count} site(s))\n"
-    )
+def format_repair(rule, repaired_count: int) -> str:
+    return f"Repair: {rule.describe_rewrite()}  ({repaired_count} site(s))\n"
 
 
 def format_delegation_change(before_delegation, after_delegation,
@@ -245,6 +243,7 @@ def format_decision(decision, device_description: str = "") -> str:
 
 
 def build_results_json(
+    rules_applied: dict,
     model_name: str,
     device_description: str,
     before_delegation,
@@ -258,7 +257,7 @@ def build_results_json(
 ) -> dict:
     """The small machine-readable summary of a run."""
     return {
-        "rule": "DD-001",
+        "rules_applied": rules_applied,
         "model": model_name,
         "device": device_description,
         "verification_passed": (

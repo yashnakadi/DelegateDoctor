@@ -208,6 +208,7 @@ delegate-doctor doctor fpn
 delegate-doctor doctor pspnet
 delegate-doctor doctor deeplabv3plus
 delegate-doctor doctor linknet
+delegate-doctor doctor ghostnet     # DD-002 demonstration
 ```
 
 Each is a different real architecture, and all six produce the same DD-001
@@ -329,6 +330,22 @@ The repaired model is numerically correct and achieves a 2.93x speedup
 Each run also writes `artifacts/run_NNN/` containing both `.pte` files, readable
 graphs, ETDump traces, profiles, `verification.json`, `benchmark.json`,
 `results.json` and `report.txt`.
+
+## Repair catalog
+
+Two accepted rules. Entering the catalog means a rule is correct and measurably
+faster on at least one supported Arm64 Android target — **not** that it is
+faster everywhere. `doctor` always benchmarks original vs repaired on your
+device and rejects the repair if it does not win there.
+
+| Rule | Pattern | Repair | Validated on |
+| --- | --- | --- | --- |
+| **DD-001** | softmax on a non-last dimension | axis canonicalization: `view → permute → softmax(-1) → permute → view` | 6 segmentation architectures, physical RMX2030, 1.30–3.79x |
+| **DD-002** | redundant `aten.alias` (a no-op that fragments the graph) | delete the node, forward its input (1 op → 0 ops) | 3 timm GhostNet variants, Arm64 **emulator**, 1.09–1.46x; physical phone inconclusive |
+
+DD-001 fixes an unsupported *configuration* of a real operator. DD-002 removes
+an operator that does nothing but split the delegate. Details:
+[`results/dd002_emulator_validation.md`](results/dd002_emulator_validation.md).
 
 ## DD-001
 

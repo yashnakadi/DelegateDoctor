@@ -116,7 +116,7 @@ def test_detection_explanation_mentions_the_key_facts():
     exported = export_to_aten(SoftmaxOnChannels().eval(), (torch.randn(1, 21, 32, 32),))
     explanation = dd001_softmax.detect(exported).detections[0].explain()
 
-    assert "DD-001 detected" in explanation
-    assert "Tensor rank: 4" in explanation
-    assert "Softmax dimension: 1" in explanation
-    assert "Last dimension: 3" in explanation
+    assert "softmax(dim=1)" in explanation
+    assert "[1, 21, 32, 32]" in explanation
+    assert "rank 4" in explanation
+    assert "last dim 3" in explanation

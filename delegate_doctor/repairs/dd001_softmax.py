@@ -119,17 +119,11 @@ class Detection:
 
     def explain(self) -> str:
         return (
-            f"{RULE_ID} detected\n"
-            f"\n"
-            f"Node: {self.node_name}\n"
-            f"Tensor rank: {self.tensor_rank}\n"
-            f"Softmax dimension: {self.softmax_dim}\n"
-            f"Last dimension: {self.last_dim}\n"
-            f"Input shape: {tuple(self.input_shape)}\n"
-            f"\n"
-            f"Reason:\n"
-            f"XNNPACK requires softmax to operate on the\n"
-            f"last dimension for this configuration."
+            f"{self.node_name}: softmax(dim={self.softmax_dim}) on "
+            f"{list(self.input_shape)} · rank {self.tensor_rank} · "
+            f"last dim {self.last_dim}\n"
+            f"  access: {self.vector_count:,} vectors x {self.vector_length} "
+            f"classes, stride {self.element_stride:,}"
         )
 
 

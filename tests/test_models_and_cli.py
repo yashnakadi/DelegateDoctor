@@ -19,6 +19,7 @@ from delegate_doctor.cli import BUILTIN_EXAMPLES, load_model_spec
 def test_all_six_model_names_are_available():
     assert models.MODEL_NAMES == [
         "unet", "unetplusplus", "fpn", "pspnet", "deeplabv3plus", "linknet",
+        "ghostnet",
     ]
 
 
@@ -53,6 +54,8 @@ def test_every_model_name_maps_to_its_own_architecture(monkeypatch):
     monkeypatch.setitem(sys.modules, "segmentation_models_pytorch", FakeSmp)
 
     for name in models.MODEL_NAMES:
+        if name in models.CLASSIFIER_NAMES:
+            continue                      # ghostnet comes from timm, not smp
         models.create_model(name)
 
     assert [cls for cls, _ in built] == [
@@ -76,10 +79,11 @@ def test_every_model_uses_the_validated_configuration(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "segmentation_models_pytorch", FakeSmp)
 
-    for name in models.MODEL_NAMES:
+    segmentation = [n for n in models.MODEL_NAMES if n not in models.CLASSIFIER_NAMES]
+    for name in segmentation:
         models.create_model(name)
 
-    assert len(captured) == len(models.MODEL_NAMES)
+    assert len(captured) == len(segmentation)
     for kwargs in captured:
         assert kwargs["encoder_name"] == "mobilenet_v2"
         assert kwargs["encoder_weights"] is None      # never downloads
@@ -107,7 +111,8 @@ def test_unknown_cli_target_lists_the_available_models():
 
 def test_display_names_are_distinct_and_not_all_unet():
     names = [models.DISPLAY_NAMES[n] for n in models.MODEL_NAMES]
-    assert names == ["U-Net", "U-Net++", "FPN", "PSPNet", "DeepLabV3+", "Linknet"]
+    assert names == ["U-Net", "U-Net++", "FPN", "PSPNet", "DeepLabV3+", "Linknet",
+                     "GhostNet-100"]
     assert len(set(names)) == len(names)
 
 
@@ -183,19 +188,21 @@ def test_failed_verification_prints_full_diagnostics():
 def test_detection_output_is_compact():
     class FakeDetection:
         node_name = "softmax"
-        input_shape = (1, 21, 256, 256)
-        tensor_rank = 4
-        softmax_dim = 1
-        last_dim = 3
-        vector_count = 65536
-        vector_length = 21
-        element_stride = 65536
+
+        def explain(self):
+            return ("softmax: softmax(dim=1) on [1, 21, 256, 256] · rank 4 · "
+                    "last dim 3\n  access: 65,536 vectors x 21 classes, "
+                    "stride 65,536")
 
     class FakeResult:
         detections = [FakeDetection()]
         skipped = []
 
-    text = reporting.format_detection(FakeResult())
+    class FakeRule:
+        RULE_ID = "DD-001"
+        RULE_TITLE = "non-last-dimension softmax"
+
+    text = reporting.format_detection(FakeRule(), FakeResult())
     assert "softmax(dim=1)" in text
     assert "[1, 21, 256, 256]" in text
     assert "65,536 vectors x 21 classes" in text

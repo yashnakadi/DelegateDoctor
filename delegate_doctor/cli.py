@@ -34,7 +34,7 @@ from . import (
     reporting,
 )
 from .decision import decide_repair
-from .repairs import dd001_softmax
+from .repairs import ALL_RULES
 from .verification import verify_repair
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,29 +192,34 @@ def run_doctor(
 
     emit(reporting.format_analysis(before_delegation, before_profile))
 
-    # --- detect DD-001 -----------------------------------------------------
-    detection_result = dd001_softmax.detect(exported_for_repair)
+    # --- detect: try each repair rule in turn ------------------------------
+    detections = [(rule, rule.detect(exported_for_repair)) for rule in ALL_RULES]
+    applicable = [(rule, found) for rule, found in detections if found.applies]
 
-    repairable_kernels = []
-    if detection_result.applies:
+    # Link measured hotspots to whichever rule can repair them.
+    repairable_kernels = {}
+    for rule, _ in applicable:
         for kernel in before_profile.portable_kernels:
-            if dd001_softmax.matches_portable_kernel(kernel.name):
-                repairable_kernels.append(kernel.name)
+            if rule.matches_portable_kernel(kernel.name):
+                repairable_kernels[kernel.name] = rule.RULE_ID
 
     emit(reporting.format_hotspots(before_profile, repairable_kernels))
 
-    if not detection_result.applies:
-        emit(reporting.format_detection(detection_result))
-        emit("\nNo DD-001 site found in this model. Nothing to repair.\n")
+    if not applicable:
+        for rule, found in detections:
+            emit(reporting.format_detection(rule, found))
+        emit("\nNo known repair pattern found in this model. Nothing to repair.\n")
         reporting.write_text("\n".join(report_parts), os.path.join(run_dir, "report.txt"))
         print(f"Artifacts: {run_dir}")
         return 0
 
-    emit(reporting.format_detection(detection_result))
-
-    # --- apply DD-001 and re-export ----------------------------------------
-    repaired_count = dd001_softmax.apply(exported_for_repair)
-    emit(reporting.format_repair(dd001_softmax.describe_rewrite(), repaired_count))
+    # --- apply every applicable rule and re-export -------------------------
+    repaired_counts = {}
+    for rule, found in applicable:
+        emit(reporting.format_detection(rule, found))
+        repaired_counts[rule.RULE_ID] = rule.apply(exported_for_repair)
+        emit(reporting.format_repair(rule, repaired_counts[rule.RULE_ID]))
+    repaired_count = sum(repaired_counts.values())
     report_parts.append(f"\nConfiguration: {model_spec.description}")
 
     after_export = export_model.lower_and_write(
@@ -319,6 +324,7 @@ def run_doctor(
     emit(reporting.format_decision(decision, device_info.short_description()))
 
     results = reporting.build_results_json(
+        rules_applied=repaired_counts,
         model_name=model_spec.name,
         device_description=device_info.describe(),
         before_delegation=before_delegation,

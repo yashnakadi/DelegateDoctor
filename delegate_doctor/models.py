@@ -89,6 +89,21 @@ def create_linknet():
     return _build(smp.Linknet)
 
 
+def create_ghostnet():
+    """timm GhostNet-100, an ImageNet classifier - the DD-002 demonstration.
+
+    Deliberately a different codebase and task from the six segmentation models.
+    Its GhostModule ends with `out[:, :self.out_chs, :, :]`; when that slice
+    covers the whole tensor it exports as a no-op `aten.alias`, which XNNPACK
+    has no config for. timm is already an installed dependency of
+    segmentation_models_pytorch, so this adds nothing new.
+    """
+    import timm
+
+    torch.manual_seed(0)
+    return timm.create_model("ghostnet_100", pretrained=False).eval()
+
+
 # Display names, so the report never calls a PSPNet a U-Net.
 DISPLAY_NAMES = {
     "unet": "U-Net",
@@ -97,7 +112,11 @@ DISPLAY_NAMES = {
     "pspnet": "PSPNet",
     "deeplabv3plus": "DeepLabV3+",
     "linknet": "Linknet",
+    "ghostnet": "GhostNet-100",
 }
+
+# Not an smp segmentation net, so it carries its own input shape and metadata.
+CLASSIFIER_NAMES = {"ghostnet"}
 
 MODEL_NAMES = list(DISPLAY_NAMES)
 
@@ -116,6 +135,8 @@ def create_model(name: str):
         return create_deeplabv3plus()
     if name == "linknet":
         return create_linknet()
+    if name == "ghostnet":
+        return create_ghostnet()
     raise ValueError(f"Unknown model: {name}")
 
 
@@ -131,6 +152,17 @@ def input_shape_text() -> str:
 def build_model_spec(name: str):
     """Build the ModelSpec DelegateDoctor's pipeline consumes."""
     from .export_model import ModelSpec
+
+    if name in CLASSIFIER_NAMES:
+        # ImageNet classifier: 224x224 in, (1, 1000) logits out. argmax over
+        # dim 1 is top-1, the meaningful semantic check for this task.
+        return ModelSpec(
+            name=f"{DISPLAY_NAMES[name]} / timm",
+            model=create_model(name),
+            example_inputs=(torch.randn(1, 3, 224, 224),),
+            argmax_dim=1,
+            description=f"timm {DISPLAY_NAMES[name]} ImageNet classifier, 224x224 input",
+        )
 
     return ModelSpec(
         name=f"{DISPLAY_NAMES[name]} / {ENCODER_DISPLAY}",
