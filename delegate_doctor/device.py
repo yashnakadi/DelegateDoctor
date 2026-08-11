@@ -57,6 +57,17 @@ class DeviceInfo:
         kind = "Arm64 Android emulator" if self.is_emulator else "Arm64 Android device"
         return f"{kind} - {self.model} ({self.abi}, Android {self.android_release})"
 
+    def short_description(self) -> str:
+        """Compact one-line form for the console header.
+
+        Emulators stay labelled: their numbers are not handset numbers, and that
+        distinction must survive being made concise.
+        """
+        text = f"{self.model} · {self.abi} · Android {self.android_release}"
+        if self.is_emulator:
+            text += " (emulator)"
+        return text
+
 
 def run_adb(*args: str, check: bool = True, serial: str | None = None) -> str:
     """Run an adb command and return its stdout.

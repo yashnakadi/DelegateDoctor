@@ -31,3 +31,8 @@ artifacts/*
 results/*
 !results/.gitkeep
 !results/example_run.txt
+# !results/dd002_research.md
+# !results/dd001_segmentation_generalization.md
+
+# Research of potential fallbacks
+research/*

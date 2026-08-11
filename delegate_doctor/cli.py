@@ -16,6 +16,7 @@ import copy
 import importlib.util
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,7 @@ from . import (
     device,
     device_verification,
     export_model,
+    models,
     profiling,
     reporting,
 )
@@ -40,9 +42,12 @@ PROJECT_DIR = os.path.dirname(PACKAGE_DIR)
 DEFAULT_RUNNERS_DIR = os.path.join(PROJECT_DIR, "runners")
 DEFAULT_ARTIFACTS_DIR = os.path.join(PROJECT_DIR, "artifacts")
 
-# Examples shipped with the prototype, by short name.
+# Demo workloads shipped with DelegateDoctor: one example file per
+# architecture. All six are real segmentation models that produce the DD-001
+# pattern naturally; see delegate_doctor/models.py.
 BUILTIN_EXAMPLES = {
-    "unet": os.path.join(PROJECT_DIR, "examples", "segmentation_unet.py"),
+    name: os.path.join(PROJECT_DIR, "examples", f"{name}.py")
+    for name in models.MODEL_NAMES
 }
 
 
@@ -59,11 +64,13 @@ def load_model_spec(model_argument: str) -> export_model.ModelSpec:
         path = model_argument
 
     if not os.path.isfile(path):
-        available = ", ".join(sorted(BUILTIN_EXAMPLES))
+        available = "\n".join(f"  {name}" for name in BUILTIN_EXAMPLES)
         raise SystemExit(
-            f"Could not find a model for '{model_argument}'.\n"
-            f"Pass a built-in example ({available}) or the path to a Python file "
-            f"that defines build_model()."
+            f"Unknown model: {model_argument}\n"
+            f"\n"
+            f"Available models:\n{available}\n"
+            f"\n"
+            f"Or pass the path to a Python file that defines build_model()."
         )
 
     module_name = "delegate_doctor_model"
@@ -124,7 +131,12 @@ def run_doctor(
     report_parts = []
 
     def emit(section: str) -> None:
-        """Print a section immediately and keep it for report.txt."""
+        """Print a section immediately and keep it for report.txt.
+
+        Sections already begin with their own blank line, so trailing newlines
+        are stripped to avoid double-spacing the console.
+        """
+        section = section.rstrip("\n")
         print(section)
         report_parts.append(section)
 
@@ -138,14 +150,15 @@ def run_doctor(
     before_dir = os.path.join(run_dir, "before")
     after_dir = os.path.join(run_dir, "after")
 
+    input_shape = "x".join(str(int(s)) for s in model_spec.example_inputs[0].shape)
     emit(reporting.format_header(
         model_name=model_spec.name,
-        description=model_spec.description,
-        target_description=device_info.describe(),
+        input_shape=input_shape,
+        target_description=device_info.short_description(),
     ))
 
     # --- export and lower the original model -------------------------------
-    print("\nExporting model and lowering with XNNPACK...")
+    print("\nExporting and lowering with XNNPACK...")
     original_exported = export_model.export_to_aten(
         model_spec.model, model_spec.example_inputs
     )
@@ -164,7 +177,7 @@ def run_doctor(
     device_input_path = save_input_for_device(benchmark_input, run_dir)
 
     # --- profile the original on the device --------------------------------
-    print("Profiling original model on device (event tracer ON)...")
+    print("Profiling original on device...")
     before_profile = profiling.profile_model(
         pte_path=before_export.pte_path,
         input_path=device_input_path,
@@ -202,6 +215,7 @@ def run_doctor(
     # --- apply DD-001 and re-export ----------------------------------------
     repaired_count = dd001_softmax.apply(exported_for_repair)
     emit(reporting.format_repair(dd001_softmax.describe_rewrite(), repaired_count))
+    report_parts.append(f"\nConfiguration: {model_spec.description}")
 
     after_export = export_model.lower_and_write(
         exported_for_repair, os.path.join(after_dir, "model.pte")
@@ -209,7 +223,7 @@ def run_doctor(
     export_model.save_readable_graphs(after_export, after_dir)
     after_delegation = delegation.analyze_delegation(after_export.edge_program_manager)
 
-    print("Profiling repaired model on device (event tracer ON)...")
+    print("Profiling repaired on device...")
     after_profile = profiling.profile_model(
         pte_path=after_export.pte_path,
         input_path=device_input_path,
@@ -227,7 +241,7 @@ def run_doctor(
     ))
 
     # --- numerical gate ----------------------------------------------------
-    print("Verifying numerical correctness...")
+    print("Verifying on host...")
     with torch.no_grad():
         eager_output = model_spec.model(benchmark_input)
     if isinstance(eager_output, (tuple, list)):
@@ -247,7 +261,7 @@ def run_doctor(
     # compare the tensors it actually produced. This is a separate, untimed
     # invocation - the benchmark below still writes no output tensors, so this
     # cannot affect latency numbers.
-    print("Verifying numerical correctness on the Android device...")
+    print("Verifying on device...")
     try:
         device_result = device_verification.run_device_verification(
             before_pte_path=before_export.pte_path,
@@ -278,7 +292,7 @@ def run_doctor(
     emit(reporting.format_verification(verification_result, device_result))
 
     # --- performance gate --------------------------------------------------
-    print("Benchmarking on device (tracer-free runner)...")
+    print("Benchmarking on device...")
     benchmark_result = benchmarking.benchmark_before_after(
         before_pte_path=before_export.pte_path,
         after_pte_path=after_export.pte_path,
@@ -302,7 +316,7 @@ def run_doctor(
         before_latency_ms=benchmark_result.before.p50_ms,
         after_latency_ms=benchmark_result.after.p50_ms,
     )
-    emit(reporting.format_decision(decision))
+    emit(reporting.format_decision(decision, device_info.short_description()))
 
     results = reporting.build_results_json(
         model_name=model_spec.name,
@@ -327,7 +341,25 @@ def run_doctor(
     return 0 if decision.accepted else 1
 
 
+def _quieten_known_upstream_warnings() -> None:
+    """Filter one specific, harmless upstream warning.
+
+    torch.export emits this FutureWarning from inside pytree once per traced
+    submodule, so a single export prints it dozens of times and buries the
+    report. It is matched by exact message text: nothing else is silenced, and
+    any warning we have not seen before still reaches the user.
+    """
+    # Matched loosely enough to survive the backticks in the upstream text, but
+    # still tied to this one message: it must mention both treespec and LeafSpec.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*treespec.*LeafSpec.*",
+        category=FutureWarning,
+    )
+
+
 def main(argv: Optional[list] = None) -> int:
+    _quieten_known_upstream_warnings()
     parser = argparse.ArgumentParser(
         prog="delegate-doctor",
         description=(
@@ -342,9 +374,10 @@ def main(argv: Optional[list] = None) -> int:
     )
     doctor.add_argument(
         "model",
+        metavar="MODEL",
         help=(
-            "built-in example name (e.g. 'unet') or path to a Python file "
-            "defining build_model()"
+            "one of: " + ", ".join(models.MODEL_NAMES)
+            + "; or the path to a Python file defining build_model()"
         ),
     )
     doctor.add_argument("--runners-dir", default=DEFAULT_RUNNERS_DIR,

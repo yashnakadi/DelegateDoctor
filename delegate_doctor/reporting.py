@@ -2,8 +2,16 @@
 
 Plain text on purpose - no terminal UI library. Each function formats one
 section and returns a string, so the CLI can print sections as they complete
-(device runs take a while) and still save the whole thing to report.txt at the
-end.
+(device runs take a while) and still save the whole thing to report.txt.
+
+Presentation rule: successful runs are terse, failures are not. A run that
+passes every gate should fit on one screen, because the only things a developer
+needs from it are what was wrong, what changed, whether it is still correct and
+whether it got faster. When a gate fails, the detailed numbers are printed
+instead, because that is when they matter.
+
+Nothing here participates in a decision - it only formats. The full metrics are
+always written to the run artifacts regardless of what is shown.
 """
 
 from __future__ import annotations
@@ -12,261 +20,227 @@ import json
 import os
 from typing import List, Optional
 
-SECTION_RULE = "-" * 40
-
 
 def _heading(title: str) -> str:
-    return f"\n{title}\n{SECTION_RULE}\n"
+    return f"\n{title}"
 
 
 def _percent(fraction: float) -> str:
     return f"{100 * fraction:.1f}%"
 
 
-def format_header(model_name: str, description: str, target_description: str) -> str:
-    lines = [
-        "DelegateDoctor",
-        "",
-        f"Model: {model_name}",
-    ]
-    if description:
-        lines.append(f"Description: {description}")
-    lines.append("Backend: ExecuTorch + XNNPACK")
-    lines.append(f"Target: {target_description}")
-    return "\n".join(lines)
-
-
-def format_analysis(
-    delegation_report,
-    profile_result,
-) -> str:
-    """Operator-count delegation next to runtime-weighted delegation.
-
-    Showing them together is the point of the tool: when they disagree, the
-    operator count is the misleading one.
-    """
-    operator_fraction = delegation_report.operator_delegation_fraction
-    runtime_fraction = profile_result.runtime_delegation_fraction
-
-    text = _heading("ANALYSIS")
-    text += (
-        f"Graph operators:             {delegation_report.total_ops}\n"
-        f"Delegated operators:         {delegation_report.delegated_op_total}\n"
-        f"Portable operators:          {delegation_report.portable_op_total}\n"
-        f"XNNPACK delegate blobs:      {delegation_report.delegate_blob_count}\n"
+def format_header(model_name: str, input_shape: str, target_description: str) -> str:
+    return (
+        f"DelegateDoctor\n"
         f"\n"
-        f"Operator-count delegation:   {_percent(operator_fraction)}\n"
-        f"Runtime-weighted delegation: {_percent(runtime_fraction)}\n"
-        f"\n"
-        f"Measured on device: {profile_result.method_execute_ms:.3f} ms per inference\n"
-        f"  inside XNNPACK:   {profile_result.delegated_ms:.3f} ms "
-        f"({profile_result.delegate_call_count} delegate call(s))\n"
-        f"  portable kernels: {profile_result.portable_ms:.3f} ms "
-        f"({profile_result.operator_call_count} operator call(s))\n"
+        f"Model:  {model_name}\n"
+        f"Input:  {input_shape}\n"
+        f"Device: {target_description}\n"
+        f"Backend: ExecuTorch + XNNPACK"
     )
 
-    if profile_result.accounting_warning:
-        text += f"\nNOTE: {profile_result.accounting_warning}\n"
 
-    # Flag the situation the tool exists to find.
-    if operator_fraction - runtime_fraction > 0.10:
-        text += (
-            "\nWARNING:\n"
-            "A small number of fallback operations\n"
-            "dominate model runtime.\n"
-        )
+def format_analysis(delegation_report, profile_result) -> str:
+    """Operator-count delegation beside runtime-weighted delegation.
+
+    Showing both on one line is the point of the tool: when they disagree, the
+    operator count is the misleading one.
+    """
+    text = _heading("ANALYSIS")
+    text += (
+        f"\n{delegation_report.total_ops} ops · "
+        f"{delegation_report.delegated_op_total} delegated · "
+        f"{delegation_report.portable_op_total} portable · "
+        f"{delegation_report.delegate_blob_count} blob(s)\n"
+        f"Delegation: {_percent(delegation_report.operator_delegation_fraction)} ops · "
+        f"{_percent(profile_result.runtime_delegation_fraction)} runtime "
+        f"({profile_result.method_execute_ms:.1f} ms/inference)\n"
+    )
+    if profile_result.accounting_warning:
+        text += f"NOTE: {profile_result.accounting_warning}\n"
+    if (delegation_report.operator_delegation_fraction
+            - profile_result.runtime_delegation_fraction) > 0.10:
+        text += "WARNING: a few fallback ops dominate runtime.\n"
     return text
 
 
-def format_hotspots(profile_result, repairable_kernel_names: List[str]) -> str:
+def format_hotspots(profile_result, repairable_kernel_names: List[str],
+                    limit: int = 3) -> str:
     """Portable kernels ranked by measured cost, most expensive first."""
-    text = _heading("FALLBACK HOTSPOTS")
-
+    text = _heading("HOTSPOTS")
     if not profile_result.portable_kernels:
-        text += "None. All measured runtime is inside XNNPACK.\n"
+        text += "\nNone. All measured runtime is inside XNNPACK.\n"
         return text
 
-    for position, kernel in enumerate(profile_result.portable_kernels, start=1):
-        has_repair = kernel.name in repairable_kernel_names
+    text += "\n"
+    for position, kernel in enumerate(profile_result.portable_kernels[:limit], start=1):
+        repair = ("DD-001 available" if kernel.name in repairable_kernel_names
+                  else "no repair rule")
         text += (
-            f"\n{position}. {kernel.operator_name}\n"
-            f"\n"
-            f"Portable runtime:            {kernel.total_ms:.3f} ms "
-            f"({kernel.call_count} call(s))\n"
-            f"Runtime impact:              {_percent(kernel.runtime_fraction)}\n"
+            f"{position}. {kernel.operator_name} · {kernel.total_ms:.1f} ms · "
+            f"{_percent(kernel.runtime_fraction)} runtime · "
+            f"x{kernel.call_count} · {repair}\n"
         )
-        if has_repair:
-            text += (
-                f"\nKnown repair:\n"
-                f"DD-001 - non-last-dimension softmax\n"
-                f"\nRepair available: YES\n"
-            )
-        else:
-            text += "\nRepair available: NO (no rule for this operator yet)\n"
+    remaining = len(profile_result.portable_kernels) - limit
+    if remaining > 0:
+        text += f"   (+{remaining} smaller fallback(s))\n"
     return text
 
 
 def format_detection(detection_result) -> str:
-    """What DD-001 found, and what it deliberately left alone."""
-    text = _heading("DD-001 DETECTION")
-
-    if not detection_result.detections and not detection_result.skipped:
-        text += "No softmax operations found in this graph.\n"
+    """What DD-001 found. One line per site."""
+    text = _heading("DD-001  non-last-dimension softmax")
+    if not detection_result.detections:
+        if not detection_result.skipped:
+            text += "\nNo softmax operations found in this graph.\n"
+        else:
+            text += "\nNot applicable:\n"
+            for skipped in detection_result.skipped:
+                text += f"  {skipped.node_name}: {skipped.reason}\n"
         return text
 
+    text += "\n"
     for detection in detection_result.detections:
-        text += detection.explain() + "\n"
         text += (
-            f"\nAccess pattern:\n"
-            f"{detection.vector_count} softmax vectors of {detection.vector_length} "
-            f"elements,\n"
-            f"{detection.element_stride} elements apart in memory.\n\n"
+            f"{detection.node_name}: softmax(dim={detection.softmax_dim}) on "
+            f"{list(detection.input_shape)} · rank {detection.tensor_rank} · "
+            f"last dim {detection.last_dim}\n"
+            f"  access: {detection.vector_count:,} vectors x "
+            f"{detection.vector_length} classes, stride "
+            f"{detection.element_stride:,}\n"
         )
-    for skipped in detection_result.skipped:
-        text += f"Skipped {skipped.node_name}: {skipped.reason}\n"
     return text
 
 
 def format_repair(rewrite_description: str, repaired_count: int) -> str:
-    text = _heading("REPAIR")
-    text += f"Applying DD-001 to {repaired_count} site(s)...\n\n"
-    text += rewrite_description + "\n"
-    text += "\nRe-exporting with XNNPACK...\n"
-    return text
+    return (
+        f"\nRepair: view -> permute -> softmax(dim=-1) -> permute -> view"
+        f"  ({repaired_count} site(s))\n"
+    )
 
 
-def format_delegation_change(
-    before_delegation,
-    after_delegation,
-    before_profile,
-    after_profile,
-) -> str:
-    text = _heading("DELEGATION AFTER REPAIR")
+def format_delegation_change(before_delegation, after_delegation,
+                             before_profile, after_profile) -> str:
+    text = _heading("AFTER REPAIR")
     text += (
-        f"                             BEFORE      AFTER\n"
-        f"\n"
-        f"Portable operators           {before_delegation.portable_op_total:>6}      "
-        f"{after_delegation.portable_op_total:>6}\n"
-        f"Operator-count delegation    {_percent(before_delegation.operator_delegation_fraction):>6}      "
-        f"{_percent(after_delegation.operator_delegation_fraction):>6}\n"
-        f"Runtime-weighted delegation  {_percent(before_profile.runtime_delegation_fraction):>6}      "
-        f"{_percent(after_profile.runtime_delegation_fraction):>6}\n"
+        f"\nPortable ops:       {before_delegation.portable_op_total} -> "
+        f"{after_delegation.portable_op_total}\n"
+        f"Op delegation:      "
+        f"{_percent(before_delegation.operator_delegation_fraction)} -> "
+        f"{_percent(after_delegation.operator_delegation_fraction)}\n"
+        f"Runtime delegation: "
+        f"{_percent(before_profile.runtime_delegation_fraction)} -> "
+        f"{_percent(after_profile.runtime_delegation_fraction)}\n"
     )
     return text
+
+
+def _detailed_metrics(label: str, metrics) -> str:
+    return (
+        f"  {label}\n"
+        f"    max abs  {metrics.max_absolute_error:.3e}\n"
+        f"    mean abs {metrics.mean_absolute_error:.3e}\n"
+        f"    mse      {metrics.mean_squared_error:.3e}\n"
+        f"    max rel  {metrics.max_relative_error:.3e}\n"
+    )
 
 
 def format_verification(verification_result, device_result=None) -> str:
-    """Correctness on the host and, separately, on the Android device.
+    """One line per stage when everything passes; full metrics when it does not.
 
-    The two blocks are shown separately so it is obvious that real Android
-    tensors were retrieved and checked, not just host ones.
+    The gates themselves are untouched - this only decides what is printed.
     """
-    text = _heading("VERIFICATION")
+    from .verification import MAX_ABSOLUTE_ERROR_TOLERANCE
 
-    metrics = verification_result.repaired_vs_original
+    text = _heading("VERIFY")
+
+    def agreement(value) -> str:
+        return f" · argmax {100 * value:.2f}%" if value is not None else ""
+
+    host = verification_result
     text += (
-        f"Host ExecuTorch - repaired vs original:\n"
-        f"  Max absolute error:        {metrics.max_absolute_error:.3e}\n"
-        f"  Mean absolute error:       {metrics.mean_absolute_error:.3e}\n"
-        f"  Mean squared error:        {metrics.mean_squared_error:.3e}\n"
-        f"  Max relative error:        {metrics.max_relative_error:.3e}\n"
+        f"\nHost:    {host.status_text} · max abs "
+        f"{host.repaired_vs_original.max_absolute_error:.2e}"
+        f"{agreement(host.argmax_agreement)}\n"
     )
-    if verification_result.repaired_vs_eager is not None:
-        eager_metrics = verification_result.repaired_vs_eager
-        text += (
-            f"  vs PyTorch eager:          "
-            f"{eager_metrics.max_absolute_error:.3e}\n"
-        )
-    if verification_result.argmax_agreement is not None:
-        text += (
-            f"  Argmax agreement:          "
-            f"{100 * verification_result.argmax_agreement:.4f}%\n"
-        )
-    for reason in verification_result.failure_reasons:
-        text += f"  FAILURE: {reason}\n"
-    text += f"  Host verification: {verification_result.status_text}\n"
 
     if device_result is None:
-        text += "\nAndroid ExecuTorch + XNNPACK: not run\n"
-        text += f"\nNumerical verification: {verification_result.status_text}\n"
-        return text
-
-    text += "\nAndroid ExecuTorch + XNNPACK (tensors pulled from the device):\n"
-    if device_result.error:
-        text += f"  ERROR: {device_result.error}\n"
-    if device_result.repaired_vs_original is not None:
-        device_metrics = device_result.repaired_vs_original
-        text += (
-            f"  Max absolute error:        "
-            f"{device_metrics.max_absolute_error:.3e}\n"
-            f"  Mean absolute error:       "
-            f"{device_metrics.mean_absolute_error:.3e}\n"
-            f"  Mean squared error:        "
-            f"{device_metrics.mean_squared_error:.3e}\n"
-            f"  Max relative error:        "
-            f"{device_metrics.max_relative_error:.3e}\n"
+        text += "Android: not run\n"
+    else:
+        device_error = (
+            f"{device_result.repaired_vs_original.max_absolute_error:.2e}"
+            if device_result.repaired_vs_original is not None else "n/a"
         )
-    if device_result.argmax_agreement is not None:
         text += (
-            f"  Argmax agreement:          "
-            f"{100 * device_result.argmax_agreement:.4f}%\n"
-        )
-    for reason in device_result.failure_reasons:
-        text += f"  FAILURE: {reason}\n"
-    text += f"  Android verification: {device_result.status_text}\n"
-
-    # Device-vs-host tells a bad repair apart from a bad backend.
-    if device_result.original_device_vs_host is not None:
-        original_delta = device_result.original_device_vs_host.max_absolute_error
-        repaired_delta = device_result.repaired_device_vs_host.max_absolute_error
-        text += (
-            f"\nDevice / host consistency (max absolute error):\n"
-            f"  Original: {original_delta:.3e}\n"
-            f"  Repaired: {repaired_delta:.3e}\n"
+            f"Android: {device_result.status_text} · max abs {device_error}"
+            f"{agreement(device_result.argmax_agreement)}\n"
         )
 
-    overall = "PASS" if (verification_result.passed and device_result.passed) else "FAIL"
-    text += f"\nNumerical verification: {overall}\n"
+    host_failed = not verification_result.passed
+    device_failed = device_result is not None and not device_result.passed
+
+    # Failures get everything; successes stay on two lines.
+    if host_failed or device_failed:
+        text += f"\ntolerance: {MAX_ABSOLUTE_ERROR_TOLERANCE:.1e}\n"
+        if host_failed:
+            text += "\nHost detail:\n"
+            text += _detailed_metrics("repaired vs original",
+                                      verification_result.repaired_vs_original)
+            if verification_result.repaired_vs_eager is not None:
+                text += _detailed_metrics("repaired vs PyTorch eager",
+                                          verification_result.repaired_vs_eager)
+            for reason in verification_result.failure_reasons:
+                text += f"  FAILURE: {reason}\n"
+        if device_failed:
+            text += "\nAndroid detail:\n"
+            if device_result.error:
+                text += f"  ERROR: {device_result.error}\n"
+            if device_result.repaired_vs_original is not None:
+                text += _detailed_metrics("repaired vs original (device)",
+                                          device_result.repaired_vs_original)
+                text += _detailed_metrics("device vs host (original)",
+                                          device_result.original_device_vs_host)
+                text += _detailed_metrics("device vs host (repaired)",
+                                          device_result.repaired_device_vs_host)
+            for reason in device_result.failure_reasons:
+                text += f"  FAILURE: {reason}\n"
     return text
 
 
 def format_benchmark(benchmark_result) -> str:
     before = benchmark_result.before
     after = benchmark_result.after
+    reduction = (
+        100 * (before.p50_ms - after.p50_ms) / before.p50_ms if before.p50_ms else 0.0
+    )
 
     text = _heading("BENCHMARK")
     text += (
-        f"Target: {benchmark_result.device_description}\n"
-        f"Threads: {benchmark_result.threads}   "
-        f"Warmup: {benchmark_result.warmup_iterations}/rep   "
-        f"Measured: {benchmark_result.measured_iterations}/rep x "
-        f"{benchmark_result.repetitions} reps = {before.sample_count} samples\n"
-        f"Runner: tracer-free executor_runner (no profiling instrumentation)\n"
+        f"\n{benchmark_result.threads} threads · "
+        f"{benchmark_result.measured_iterations}x{benchmark_result.repetitions} "
+        f"iterations ({before.sample_count} samples) · tracer-free\n"
         f"\n"
-        f"                         BEFORE      AFTER\n"
+        f"           before      after\n"
+        f"p50    {before.p50_ms:9.2f}  {after.p50_ms:9.2f} ms\n"
+        f"p95    {before.p95_ms:9.2f}  {after.p95_ms:9.2f} ms\n"
+        f"mean   {before.mean_ms:9.2f}  {after.mean_ms:9.2f} ms\n"
         f"\n"
-        f"p50 latency          {before.p50_ms:>10.3f} ms  {after.p50_ms:>8.3f} ms\n"
-        f"p95 latency          {before.p95_ms:>10.3f} ms  {after.p95_ms:>8.3f} ms\n"
-        f"p99 latency          {before.p99_ms:>10.3f} ms  {after.p99_ms:>8.3f} ms\n"
-        f"mean latency         {before.mean_ms:>10.3f} ms  {after.mean_ms:>8.3f} ms\n"
-        f"throughput           {before.throughput_per_second:>10.1f}/s  "
-        f"{after.throughput_per_second:>8.1f}/s\n"
-        f"\n"
-        f"Speedup (p50):       {benchmark_result.p50_speedup:>10.2f}x\n"
+        f"{benchmark_result.p50_speedup:.2f}x speedup · {reduction:.1f}% lower p50\n"
     )
     if benchmark_result.device_is_emulator:
-        text += (
-            "\nNOTE: measured on an Arm64 Android emulator, not a handset. "
-            "Arm64 code\nruns natively, but cache sizes, memory bandwidth and "
-            "CPU scheduling differ\nfrom a phone. Treat the exact multiplier as "
-            "provisional.\n"
-        )
+        text += "NOTE: Arm64 emulator, not a handset - treat the multiplier as provisional.\n"
     return text
 
 
-def format_decision(decision) -> str:
-    text = _heading("DECISION")
-    text += f"{decision.headline}\n\n{decision.message}\n"
+def format_decision(decision, device_description: str = "") -> str:
+    text = _heading(decision.headline.replace("REPAIR ", ""))
+    if decision.accepted:
+        target = f" on {device_description}" if device_description else ""
+        text += (
+            f"\nCorrect and {decision.speedup:.2f}x faster{target}.\n"
+        )
+    else:
+        text += f"\n{decision.message}\n"
     return text
 
 

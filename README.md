@@ -64,6 +64,32 @@ That gap is the whole point of the project.
 Full recorded run: [`results/example_run.txt`](results/example_run.txt).
 These are emulator numbers, not handset numbers — see [Limitations](#limitations).
 
+### The same rule across six architectures
+
+On a physical **RMX2030** (Snapdragon 665, arm64-v8a, Android 10), the *same*
+unchanged DD-001 rule was applied to six independent segmentation
+architectures. All six passed host and Android verification with 100% argmax
+agreement:
+
+| Architecture | Softmax runtime | Runtime delegation | p50 before → after | Speedup | Runs |
+| --- | ---: | ---: | ---: | ---: | :-: |
+| PSPNet | 38.0% | 61.9% → 99.4% | 242.69 → 65.53 ms | **3.794x** | median of 3 |
+| Linknet | 42.0% | 58.0% → 100.0% | 267.09 → 111.82 ms | **2.217x** | median of 3 |
+| DeepLabV3+ | 38.6% | 61.4% → 100.0% | 286.29 → 180.38 ms | 1.587x | single run |
+| FPN | 22.8% | 73.6% → 93.1% | 394.77 → 253.65 ms | 1.556x | single run |
+| U-Net | 20.8% | 75.1% → 94.0% | 459.61 → 338.10 ms | 1.359x | single run |
+| U-Net++ | 18.0% | 77.2% → 93.7% | 573.52 → 442.84 ms | 1.295x | single run |
+
+**Only PSPNet and Linknet are repeated medians** (3 runs each); the other four
+are single runs and should be read as indicative. The p50 columns show the
+first run in every case.
+
+The honest claim is not "DD-001 makes segmentation models faster". It is that
+DD-001 recognises the same backend-hostile class-softmax pattern across six
+independent architectures and repairs them all with one rule, with a benefit
+that depends on how expensive that fallback is in each model. Full method and
+caveats: [`results/dd001_segmentation_generalization.md`](results/dd001_segmentation_generalization.md).
+
 ## How It Works
 
 **Profiling.** The model runs on the device under an ExecuTorch build with the
@@ -172,6 +198,23 @@ adb wait-for-device
 ```bash
 delegate-doctor doctor unet
 ```
+
+Six real segmentation architectures ship as demo workloads:
+
+```bash
+delegate-doctor doctor unet
+delegate-doctor doctor unetplusplus
+delegate-doctor doctor fpn
+delegate-doctor doctor pspnet
+delegate-doctor doctor deeplabv3plus
+delegate-doctor doctor linknet
+```
+
+Each is a different real architecture, and all six produce the same DD-001
+pattern naturally through the documented `activation="softmax2d"` option. The
+same model-independent repair handles every one of them — there is no
+per-architecture code. Every invocation measures the connected device; nothing
+is pre-computed.
 
 Exit code is 0 if the repair was accepted, 1 if rejected, 2 on a setup or device
 error. Useful flags:
@@ -434,6 +477,7 @@ real during development, and both are regression-tested:
 delegate-doctor/
 ├── delegate_doctor/
 │   ├── cli.py               the doctor / setup-android commands
+│   ├── models.py            the six demo architectures
 │   ├── android_setup.py     fetch pinned ExecuTorch source, build runners
 │   ├── export_model.py      export + XNNPACK lowering + .pte
 │   ├── delegation.py        operator-count delegation
@@ -447,7 +491,8 @@ delegate-doctor/
 │   └── repairs/
 │       └── dd001_softmax.py DD-001 detection and rewrite
 ├── examples/
-│   └── segmentation_unet.py the demo workload (not part of the tool)
+│   ├── unet.py  unetplusplus.py  fpn.py
+│   └── pspnet.py  deeplabv3plus.py  linknet.py   six demo workloads
 ├── tests/
 ├── runners/                 built by setup-android (git-ignored)
 ├── artifacts/               per-run output (git-ignored)
