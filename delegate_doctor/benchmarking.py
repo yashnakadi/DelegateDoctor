@@ -135,9 +135,15 @@ def run_one_pass(
     remote_input_name: str,
     total_iterations: int,
     threads: int,
+    serial: str | None = None,
 ) -> List[float]:
-    """Run the model once for `total_iterations` and return per-iteration times."""
-    device.clear_logcat()
+    """Run the model once for `total_iterations` and return per-iteration times.
+
+    Note `--print_output none`: the timed benchmark never writes output tensors.
+    Device-side correctness checking is a separate invocation in
+    `device_verification.py`, so file I/O cannot leak into these latencies.
+    """
+    device.clear_logcat(serial=serial)
     command = (
         f"cd {device.DEVICE_WORK_DIR} && "
         f"./{device.BENCH_RUNNER_NAME} "
@@ -147,9 +153,9 @@ def run_one_pass(
         f"--cpu_threads {threads} "
         f"--print_output none"
     )
-    device.run_on_device(command)
+    device.run_on_device(command, serial=serial)
 
-    log_text = device.read_executorch_logcat()
+    log_text = device.read_executorch_logcat(serial=serial)
     latencies = [
         float(match.group(3)) for match in ITERATION_LINE_PATTERN.finditer(log_text)
     ]
@@ -179,8 +185,9 @@ def benchmark_before_after(
     ExecuTorch build, device, and iteration counts. The only difference is the
     program itself.
     """
-    device.prepare_work_dir()
-    device.push_runner(bench_runner_path)
+    serial = device_info.serial
+    device.prepare_work_dir(serial=serial)
+    device.push_runner(bench_runner_path, serial=serial)
 
     # Explicit distinct remote names. The two .pte files usually share a
     # basename (before/model.pte and after/model.pte), so pushing them under
@@ -189,9 +196,9 @@ def benchmark_before_after(
     remote_before = "before_model.pte"
     remote_after = "after_model.pte"
     remote_input = "benchmark_input.bin"
-    device.push_file(before_pte_path, remote_before)
-    device.push_file(after_pte_path, remote_after)
-    device.push_file(input_path, remote_input)
+    device.push_file(before_pte_path, remote_before, serial=serial)
+    device.push_file(after_pte_path, remote_after, serial=serial)
+    device.push_file(input_path, remote_input, serial=serial)
 
     total_iterations = warmup_iterations + measured_iterations
     before_samples: List[float] = []
@@ -199,8 +206,12 @@ def benchmark_before_after(
 
     for _ in range(repetitions):
         # Interleaved so device drift affects both models equally.
-        before_pass = run_one_pass(remote_before, remote_input, total_iterations, threads)
-        after_pass = run_one_pass(remote_after, remote_input, total_iterations, threads)
+        before_pass = run_one_pass(
+            remote_before, remote_input, total_iterations, threads, serial=serial
+        )
+        after_pass = run_one_pass(
+            remote_after, remote_input, total_iterations, threads, serial=serial
+        )
         # The first iterations include lazy allocation and cache warm-up.
         before_samples.extend(before_pass[warmup_iterations:])
         after_samples.extend(after_pass[warmup_iterations:])

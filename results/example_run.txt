@@ -25,6 +25,9 @@ segmentation_models_pytorch U-Net, MobileNetV2 encoder,
 The softmax DD-001 repairs is the library's own `nn.Softmax(dim=1)`, produced by
 the documented `activation="softmax2d"` option. Nothing was inserted.
 
+Latency was measured in a separate, tracer-free invocation that writes no
+output tensors, so device verification cannot affect these numbers.
+
 Analysis (before repair)
 ------------------------
 Graph operators:              190
@@ -32,12 +35,12 @@ Delegated operators:          184
 Portable operators:             6
 
 Operator-count delegation:   96.8%
-Runtime-weighted delegation: 35.0%
+Runtime-weighted delegation: 34.3%
 
 Fallback hotspot
 ----------------
 1. _softmax.out
-   Portable runtime:  ~62.7% of total inference time
+   Portable runtime:  52.366 ms, 63.4% of total inference time
    Known repair:      DD-001 - non-last-dimension softmax
 
 2. upsample_nearest2d.vec_out
@@ -56,19 +59,38 @@ Delegation after repair
                              BEFORE      AFTER
 Portable operators                6           5
 Operator-count delegation     96.8%      97.4%
-Runtime-weighted delegation   35.0%      93.1%
+Runtime-weighted delegation   34.3%      93.2%
 
-Verification
-------------
-Max absolute error:   1.863e-08   (tolerance 1e-5)
-Argmax agreement:     100.0000%
+Verification (host AND device)
+------------------------------
+Host ExecuTorch - repaired vs original:
+  Max absolute error:   1.863e-08   (tolerance 1e-5)
+  Argmax agreement:     100.0000%
+  PASS
+
+Android ExecuTorch + XNNPACK - repaired vs original, using the tensors the
+device actually produced and returned over adb:
+  Max absolute error:   1.863e-08
+  Argmax agreement:     100.0000%
+  PASS
+
+Device / host consistency (max absolute error):
+  Original: 1.118e-08     <- tiny fp difference between the host and Android
+  Repaired: 0.000e+00        XNNPACK builds, well inside tolerance
+
 Numerical verification: PASS
+
+Output tensors compared: 1x21x256x256 float32, 5,505,024 bytes each,
+pulled from the device with adb.
 
 Benchmark (tracer-free runner)
 ------------------------------
                          BEFORE      AFTER
-p50 latency           76.493 ms   26.114 ms
-Speedup (p50):            2.93x   (65.9% lower p50 latency)
+p50 latency           77.545 ms   26.853 ms
+p95 latency           89.836 ms   39.402 ms
+Speedup (p50):            2.89x   (65.4% lower p50 latency)
+
+Recorded from artifacts/run_003.
 
 Decision
 --------

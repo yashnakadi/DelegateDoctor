@@ -155,11 +155,17 @@ def format_delegation_change(
     return text
 
 
-def format_verification(verification_result) -> str:
+def format_verification(verification_result, device_result=None) -> str:
+    """Correctness on the host and, separately, on the Android device.
+
+    The two blocks are shown separately so it is obvious that real Android
+    tensors were retrieved and checked, not just host ones.
+    """
     text = _heading("VERIFICATION")
+
     metrics = verification_result.repaired_vs_original
     text += (
-        f"Repaired vs original ExecuTorch output:\n"
+        f"Host ExecuTorch - repaired vs original:\n"
         f"  Max absolute error:        {metrics.max_absolute_error:.3e}\n"
         f"  Mean absolute error:       {metrics.mean_absolute_error:.3e}\n"
         f"  Mean squared error:        {metrics.mean_squared_error:.3e}\n"
@@ -168,17 +174,59 @@ def format_verification(verification_result) -> str:
     if verification_result.repaired_vs_eager is not None:
         eager_metrics = verification_result.repaired_vs_eager
         text += (
-            f"\nRepaired vs PyTorch eager output:\n"
-            f"  Max absolute error:        {eager_metrics.max_absolute_error:.3e}\n"
+            f"  vs PyTorch eager:          "
+            f"{eager_metrics.max_absolute_error:.3e}\n"
         )
     if verification_result.argmax_agreement is not None:
         text += (
-            f"\nArgmax agreement:            "
+            f"  Argmax agreement:          "
             f"{100 * verification_result.argmax_agreement:.4f}%\n"
         )
     for reason in verification_result.failure_reasons:
-        text += f"\nFAILURE: {reason}\n"
-    text += f"\nNumerical verification: {verification_result.status_text}\n"
+        text += f"  FAILURE: {reason}\n"
+    text += f"  Host verification: {verification_result.status_text}\n"
+
+    if device_result is None:
+        text += "\nAndroid ExecuTorch + XNNPACK: not run\n"
+        text += f"\nNumerical verification: {verification_result.status_text}\n"
+        return text
+
+    text += "\nAndroid ExecuTorch + XNNPACK (tensors pulled from the device):\n"
+    if device_result.error:
+        text += f"  ERROR: {device_result.error}\n"
+    if device_result.repaired_vs_original is not None:
+        device_metrics = device_result.repaired_vs_original
+        text += (
+            f"  Max absolute error:        "
+            f"{device_metrics.max_absolute_error:.3e}\n"
+            f"  Mean absolute error:       "
+            f"{device_metrics.mean_absolute_error:.3e}\n"
+            f"  Mean squared error:        "
+            f"{device_metrics.mean_squared_error:.3e}\n"
+            f"  Max relative error:        "
+            f"{device_metrics.max_relative_error:.3e}\n"
+        )
+    if device_result.argmax_agreement is not None:
+        text += (
+            f"  Argmax agreement:          "
+            f"{100 * device_result.argmax_agreement:.4f}%\n"
+        )
+    for reason in device_result.failure_reasons:
+        text += f"  FAILURE: {reason}\n"
+    text += f"  Android verification: {device_result.status_text}\n"
+
+    # Device-vs-host tells a bad repair apart from a bad backend.
+    if device_result.original_device_vs_host is not None:
+        original_delta = device_result.original_device_vs_host.max_absolute_error
+        repaired_delta = device_result.repaired_device_vs_host.max_absolute_error
+        text += (
+            f"\nDevice / host consistency (max absolute error):\n"
+            f"  Original: {original_delta:.3e}\n"
+            f"  Repaired: {repaired_delta:.3e}\n"
+        )
+
+    overall = "PASS" if (verification_result.passed and device_result.passed) else "FAIL"
+    text += f"\nNumerical verification: {overall}\n"
     return text
 
 
@@ -230,6 +278,7 @@ def build_results_json(
     before_profile,
     after_profile,
     verification_result,
+    device_verification_result,
     benchmark_result,
     decision,
 ) -> dict:
@@ -238,7 +287,11 @@ def build_results_json(
         "rule": "DD-001",
         "model": model_name,
         "device": device_description,
-        "verification_passed": verification_result.passed,
+        "verification_passed": (
+            verification_result.passed and device_verification_result.passed
+        ),
+        "host_verification_passed": verification_result.passed,
+        "device_verification_passed": device_verification_result.passed,
         "operator_delegation_before": before_delegation.operator_delegation_fraction,
         "operator_delegation_after": after_delegation.operator_delegation_fraction,
         "runtime_delegation_before": before_profile.runtime_delegation_fraction,

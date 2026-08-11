@@ -27,14 +27,16 @@ Operator counts weight every node equally. Hardware does not.
 ```
 model -> export -> XNNPACK partition -> analyse fallbacks -> profile on device
       -> rank hotspots by measured time -> detect a known pattern -> repair
-      -> re-export -> verify numerically -> benchmark -> accept or reject
+      -> re-export -> verify on host -> verify on device -> benchmark
+      -> accept or reject
 ```
 
 It reports **runtime-weighted delegation** — the share of wall time actually
 spent inside XNNPACK, measured on the device with ETDump — and ranks every
 fallback by the milliseconds it costs. When it recognises a repairable pattern
-it rewrites the graph, then puts the result through two gates: outputs must
-match, and latency must improve. Failing either gate discards the repair.
+it rewrites the graph, then puts the result through three gates: host outputs
+must match, the tensors the **Android device actually produced** must match, and
+latency must improve. Failing any gate discards the repair.
 
 ## Demonstrated Result
 
@@ -43,18 +45,19 @@ encoder, 21 classes, 256x256 input. Measured on an Arm64 Android emulator.
 
 ```
 Operator-count delegation:    96.8%  ->  97.4%      +0.6 points
-Runtime-weighted delegation:  35.0%  ->  93.1%
+Runtime-weighted delegation:  34.3%  ->  93.2%
 
-p50 latency:                76.493 ms -> 26.114 ms  2.93x (65.9% lower)
+p50 latency:                77.545 ms -> 26.853 ms  2.89x (65.4% lower)
 
-Max absolute error: 1.863e-08     Argmax agreement: 100%
+Host verification:   max abs error 1.863e-08, argmax agreement 100%
+Android verification: max abs error 1.863e-08, argmax agreement 100%
 REPAIR ACCEPTED
 ```
 
 Operator-count delegation moved by 0.6 percentage points. A tool reporting only
 operator counts would have called this model already optimised. Median latency
-fell by roughly two thirds — because **one portable softmax accounted for about
-63% of runtime**.
+fell by roughly two thirds — because **one portable softmax accounted for 63.4%
+of runtime**.
 
 That gap is the whole point of the project.
 
@@ -74,8 +77,11 @@ instrumentation can never contaminate the number a decision rests on.
 model is re-exported and re-partitioned so the improvement is real rather than
 assumed.
 
-**Gates.** Outputs of the original and repaired programs are compared
-element-wise; latency is compared on the device. Both must pass.
+**Gates.** Outputs are compared element-wise on the host *and* on the Android
+device, using tensors pulled back over `adb`; latency is compared on the device.
+All must pass. A rewrite can be correct on the host and still hit a
+backend-specific bug, which is why the device check is part of the gate rather
+than a diagnostic.
 
 ---
 
@@ -246,8 +252,19 @@ Input shape: (1, 21, 256, 256)
 
 VERIFICATION
 ----------------------------------------
-Max absolute error:        1.863e-08
-Argmax agreement:          100.0000%
+Host ExecuTorch - repaired vs original:
+  Max absolute error:        1.863e-08
+  Argmax agreement:          100.0000%
+  Host verification: PASS
+
+Android ExecuTorch + XNNPACK (tensors pulled from the device):
+  Max absolute error:        1.863e-08
+  Argmax agreement:          100.0000%
+  Android verification: PASS
+
+Device / host consistency (max absolute error):
+  Original: 1.118e-08
+  Repaired: 0.000e+00
 
 Numerical verification: PASS
 
@@ -353,13 +370,32 @@ burned the time, turning a percentage into a ranked hotspot list.
 
 A repair is kept only if it passes both.
 
-**Numerical gate** (`delegate_doctor/verification.py`). Thresholds are at the
+Correctness is checked **twice**, on the host and on the Android device.
+
+**Host gate** (`delegate_doctor/verification.py`). Both `.pte` files run through
+ExecuTorch's Python runtime and their outputs are compared. Thresholds are at the
 top of the module:
 
 ```python
 MAX_ABSOLUTE_ERROR_TOLERANCE = 1e-5   # ~100x fp32 epsilon
 REQUIRED_ARGMAX_AGREEMENT = 1.0       # every pixel keeps its predicted class
 ```
+
+**Device gate** (`delegate_doctor/device_verification.py`). A graph rewrite can
+be mathematically equivalent and still trigger a device- or backend-specific
+correctness bug — the Android build of XNNPACK is different compiled code on a
+different architecture. DelegateDoctor therefore runs both `.pte` files on the
+Arm64 target, pulls the real output tensors back with `adb`, and checks them
+using the same thresholds:
+
+- repaired vs original, both measured **on the device** — did the repair change
+  the answer on real hardware?
+- each model's device output vs its own host output — this separates "the repair
+  is wrong" from "the backend is wrong".
+
+This is a separate, untimed invocation. The timed benchmark still runs with
+`--print_output none` and writes no tensors, so output capture cannot pollute
+latency numbers.
 
 **Performance gate** (`delegate_doctor/benchmarking.py`). Both `.pte` files are
 benchmarked on the device under identical conditions — same input bytes, same
@@ -369,8 +405,18 @@ hits both equally.
 **Decision** (`delegate_doctor/decision.py`):
 
 ```python
-def decide_repair(verification_passed, before_latency_ms, after_latency_ms) -> RepairDecision
+def decide_repair(
+    host_verification_passed,
+    device_verification_passed,
+    before_latency_ms,
+    after_latency_ms,
+) -> RepairDecision
 ```
+
+A repair is accepted only when **host verification passes, Android verification
+passes, and p50 latency improves**. A repair that improves delegation, runs
+nearly 3x faster and verifies on the host is still rejected if the tensors the
+device produced do not verify.
 
 Note what is *not* a parameter: delegation. It is diagnostic, never an
 acceptance criterion. Both rejection paths exist because both were needed for
@@ -392,7 +438,8 @@ delegate-doctor/
 │   ├── export_model.py      export + XNNPACK lowering + .pte
 │   ├── delegation.py        operator-count delegation
 │   ├── profiling.py         ETDump -> runtime-weighted delegation, hotspots
-│   ├── verification.py      the numerical gate
+│   ├── verification.py      the host numerical gate
+│   ├── device_verification.py  pull Android tensors and check them
 │   ├── benchmarking.py      on-device latency, tracer-free
 │   ├── decision.py          accept / reject
 │   ├── device.py            adb and runner discovery
@@ -425,6 +472,11 @@ no ExecuTorch source checkout. Subprocess and filesystem boundaries are mocked.
   change too small to breach the error budget still fails if it flips a class.
 - `test_decision_gate.py` — the four correct/incorrect x faster/slower
   combinations, plus regression tests for both real failures above.
+- `test_device_verification.py` — binary tensor parsing (truncated, empty,
+  oversized, wrong dtype), adb command construction with the selected serial,
+  distinct before/after filenames, and the device checks that reject a wrong
+  Android tensor. Includes a guard that the timed benchmark never gains
+  `--output_file`.
 - `test_android_setup.py` — version pinning, tool and NDK discovery, source
   checkout logic, runner install and verification, idempotence, CLI dispatch.
 
@@ -470,8 +522,10 @@ single instrumented binary would quietly corrupt every latency measurement.
   rough scale of the effect are sound; treat the exact multiplier as provisional
   until re-measured on real hardware. A physical device works through the same
   `adb` path with no code changes.
-- **Verification runs on the host**, comparing the two `.pte` files through
-  ExecuTorch's Python runtime rather than on the device.
+- **Device verification covers the first output tensor, fp32 only.** The Android
+  runner writes raw bytes with no dtype tag, so the expected dtype, shape and
+  byte count come from the host result and anything else is rejected rather than
+  reinterpreted.
 - **First `setup-android` needs network and an NDK**, and downloads roughly a
   gigabyte into `.build/`.
 - **Runner architecture verification depends on the host `file` tool**; where it

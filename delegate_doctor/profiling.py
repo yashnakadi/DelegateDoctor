@@ -124,6 +124,7 @@ def collect_etdump(
     etdump_runner_path: str,
     output_etdump_path: str,
     label: str,
+    serial: str | None = None,
     iterations: int = 20,
     threads: int = 4,
 ) -> str:
@@ -133,14 +134,14 @@ def collect_etdump(
     .pte files normally share a basename, so pushing them under their basenames
     would let one overwrite the other.
     """
-    device.prepare_work_dir()
-    device.push_runner(etdump_runner_path)
+    device.prepare_work_dir(serial=serial)
+    device.push_runner(etdump_runner_path, serial=serial)
 
     remote_pte_name = f"{label}_profile_model.pte"
     remote_input_name = f"{label}_profile_input.bin"
     remote_dump_name = f"{label}_trace.etdump"
-    device.push_file(pte_path, remote_pte_name)
-    device.push_file(input_path, remote_input_name)
+    device.push_file(pte_path, remote_pte_name, serial=serial)
+    device.push_file(input_path, remote_input_name, serial=serial)
 
     command = (
         f"cd {device.DEVICE_WORK_DIR} && "
@@ -152,12 +153,13 @@ def collect_etdump(
         f"--print_output none "
         f"--etdump_path {remote_dump_name}"
     )
-    device.run_on_device(command)
+    device.run_on_device(command, serial=serial)
 
-    parent = os.path.dirname(output_etdump_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    device.run_adb("pull", f"{device.DEVICE_WORK_DIR}/{remote_dump_name}", output_etdump_path)
+    device.pull_file(
+        f"{device.DEVICE_WORK_DIR}/{remote_dump_name}",
+        output_etdump_path,
+        serial=serial,
+    )
     return output_etdump_path
 
 
@@ -241,6 +243,7 @@ def profile_model(
     etdump_runner_path: str,
     output_etdump_path: str,
     label: str,
+    serial: str | None = None,
     iterations: int = 20,
     threads: int = 4,
 ) -> ProfileResult:
@@ -258,6 +261,7 @@ def profile_model(
         etdump_runner_path=etdump_runner_path,
         output_etdump_path=output_etdump_path,
         label=label,
+        serial=serial,
         iterations=iterations,
         threads=threads,
     )

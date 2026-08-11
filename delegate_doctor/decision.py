@@ -27,7 +27,8 @@ from dataclasses import dataclass
 
 # Outcome strings, also used as the `decision` field in the JSON results.
 ACCEPTED = "accepted"
-REJECTED_VERIFICATION = "rejected_verification_failed"
+REJECTED_VERIFICATION = "rejected_host_verification_failed"
+REJECTED_DEVICE_VERIFICATION = "rejected_device_verification_failed"
 REJECTED_PERFORMANCE = "rejected_no_performance_improvement"
 
 # A recommendation, not a correctness threshold. Any measurable improvement is
@@ -66,7 +67,9 @@ class RepairDecision:
         if self.outcome == ACCEPTED:
             return "REPAIR ACCEPTED"
         if self.outcome == REJECTED_VERIFICATION:
-            return "REPAIR REJECTED - numerical verification failed"
+            return "REPAIR REJECTED - host numerical verification failed"
+        if self.outcome == REJECTED_DEVICE_VERIFICATION:
+            return "REPAIR REJECTED - Android numerical verification failed"
         return "REPAIR REJECTED - no performance improvement"
 
     def to_dict(self) -> dict:
@@ -81,11 +84,21 @@ class RepairDecision:
 
 
 def decide_repair(
-    verification_passed: bool,
+    host_verification_passed: bool,
+    device_verification_passed: bool,
     before_latency_ms: float,
     after_latency_ms: float,
 ) -> RepairDecision:
-    """Accept the repair only if it is both correct and faster.
+    """Accept the repair only if it is correct on both host and device, and faster.
+
+    Correctness is checked twice, on purpose:
+
+      * `host_verification_passed`   - the two .pte files compared through
+        ExecuTorch's Python runtime on the development machine. Catches a wrong
+        rewrite.
+      * `device_verification_passed` - the tensors the Android device actually
+        produced. Catches a backend-specific miscompilation that the host cannot
+        see, which is a failure mode we have observed for real.
 
     Latencies are p50 (median) on the Arm target, measured with the tracer-free
     runner so profiling instrumentation cannot influence the comparison.
@@ -97,16 +110,31 @@ def decide_repair(
 
     # Correctness is checked first, and it is absolute. A faster wrong answer is
     # still a wrong answer.
-    if not verification_passed:
+    if not host_verification_passed:
         return RepairDecision(
             outcome=REJECTED_VERIFICATION,
             speedup=speedup,
             before_latency_ms=before_latency_ms,
             after_latency_ms=after_latency_ms,
             message=(
-                "The repaired model does not reproduce the original outputs "
-                "within tolerance. Performance is irrelevant when the answer "
-                "is wrong, so the repair was discarded."
+                "On the host, the repaired model does not reproduce the original "
+                "outputs within tolerance. Performance is irrelevant when the "
+                "answer is wrong, so the repair was discarded."
+            ),
+        )
+
+    if not device_verification_passed:
+        return RepairDecision(
+            outcome=REJECTED_DEVICE_VERIFICATION,
+            speedup=speedup,
+            before_latency_ms=before_latency_ms,
+            after_latency_ms=after_latency_ms,
+            message=(
+                "The tensors produced on the Android device did not pass "
+                "verification, even though the host comparison did. That is the "
+                "signature of a backend-specific problem, and it is exactly the "
+                "case a host-only check would have missed, so the repair was "
+                "discarded."
             ),
         )
 

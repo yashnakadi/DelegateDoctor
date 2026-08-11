@@ -26,6 +26,7 @@ from . import (
     benchmarking,
     delegation,
     device,
+    device_verification,
     export_model,
     profiling,
     reporting,
@@ -170,6 +171,7 @@ def run_doctor(
         etdump_runner_path=etdump_runner,
         output_etdump_path=os.path.join(before_dir, "trace.etdump"),
         label="before",
+        serial=device_info.serial,
         iterations=profile_iterations,
         threads=threads,
     )
@@ -214,6 +216,7 @@ def run_doctor(
         etdump_runner_path=etdump_runner,
         output_etdump_path=os.path.join(after_dir, "trace.etdump"),
         label="after",
+        serial=device_info.serial,
         iterations=profile_iterations,
         threads=threads,
     )
@@ -239,10 +242,40 @@ def run_doctor(
         eager_output=eager_output,
         argmax_dim=model_spec.argmax_dim,
     )
+
+    # Device-side verification: run both .pte files on the Android target and
+    # compare the tensors it actually produced. This is a separate, untimed
+    # invocation - the benchmark below still writes no output tensors, so this
+    # cannot affect latency numbers.
+    print("Verifying numerical correctness on the Android device...")
+    try:
+        device_result = device_verification.run_device_verification(
+            before_pte_path=before_export.pte_path,
+            after_pte_path=after_export.pte_path,
+            input_path=device_input_path,
+            bench_runner_path=bench_runner,
+            original_host_output=original_output,
+            repaired_host_output=repaired_output,
+            output_dir=run_dir,
+            serial=device_info.serial,
+            argmax_dim=model_spec.argmax_dim,
+            threads=threads,
+        )
+    except device_verification.DeviceVerificationError as error:
+        device_result = device_verification.DeviceVerificationResult(
+            passed=False,
+            failure_reasons=[str(error)],
+            error=str(error),
+        )
+
     reporting.write_json(
-        verification_result.to_dict(), os.path.join(run_dir, "verification.json")
+        {
+            "host": verification_result.to_dict(),
+            "device": device_result.to_dict(),
+        },
+        os.path.join(run_dir, "verification.json"),
     )
-    emit(reporting.format_verification(verification_result))
+    emit(reporting.format_verification(verification_result, device_result))
 
     # --- performance gate --------------------------------------------------
     print("Benchmarking on device (tracer-free runner)...")
@@ -264,7 +297,8 @@ def run_doctor(
 
     # --- accept or reject --------------------------------------------------
     decision = decide_repair(
-        verification_passed=verification_result.passed,
+        host_verification_passed=verification_result.passed,
+        device_verification_passed=device_result.passed,
         before_latency_ms=benchmark_result.before.p50_ms,
         after_latency_ms=benchmark_result.after.p50_ms,
     )
@@ -278,6 +312,7 @@ def run_doctor(
         before_profile=before_profile,
         after_profile=after_profile,
         verification_result=verification_result,
+        device_verification_result=device_result,
         benchmark_result=benchmark_result,
         decision=decision,
     )

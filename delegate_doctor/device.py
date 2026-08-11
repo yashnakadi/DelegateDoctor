@@ -36,6 +36,11 @@ class DeviceError(RuntimeError):
 
 @dataclass
 class DeviceInfo:
+    # adb serial of the target we selected. Every later adb call passes this
+    # explicitly with `adb -s <serial>`, so profiling, verification and
+    # benchmarking can never drift onto a different device if more than one is
+    # attached later in the run.
+    serial: str
     model: str
     abi: str
     android_release: str
@@ -53,11 +58,20 @@ class DeviceInfo:
         return f"{kind} - {self.model} ({self.abi}, Android {self.android_release})"
 
 
-def run_adb(*args: str, check: bool = True) -> str:
-    """Run an adb command and return its stdout."""
+def run_adb(*args: str, check: bool = True, serial: str | None = None) -> str:
+    """Run an adb command and return its stdout.
+
+    `serial` selects a specific target with `adb -s`. Passing it explicitly is
+    safer than relying on adb's implicit choice, which fails or picks the wrong
+    device as soon as a second target appears.
+    """
+    command = ["adb"]
+    if serial:
+        command += ["-s", serial]
+    command += list(args)
     try:
         completed = subprocess.run(
-            ["adb", *args], capture_output=True, text=True, check=check
+            command, capture_output=True, text=True, check=check
         )
     except FileNotFoundError:
         raise DeviceError(
@@ -96,12 +110,18 @@ def require_device() -> DeviceInfo:
             "Disconnect all but one, or set ANDROID_SERIAL."
         )
 
+    serial = connected[0]
     info = DeviceInfo(
-        model=run_adb("shell", "getprop", "ro.product.model").strip(),
-        abi=run_adb("shell", "getprop", "ro.product.cpu.abi").strip(),
-        android_release=run_adb("shell", "getprop", "ro.build.version.release").strip(),
-        sdk_level=run_adb("shell", "getprop", "ro.build.version.sdk").strip(),
-        hardware=run_adb("shell", "getprop", "ro.hardware").strip(),
+        serial=serial,
+        model=run_adb("shell", "getprop", "ro.product.model", serial=serial).strip(),
+        abi=run_adb("shell", "getprop", "ro.product.cpu.abi", serial=serial).strip(),
+        android_release=run_adb(
+            "shell", "getprop", "ro.build.version.release", serial=serial
+        ).strip(),
+        sdk_level=run_adb(
+            "shell", "getprop", "ro.build.version.sdk", serial=serial
+        ).strip(),
+        hardware=run_adb("shell", "getprop", "ro.hardware", serial=serial).strip(),
     )
 
     if info.abi != "arm64-v8a":
@@ -136,28 +156,50 @@ def find_runner(runners_dir: str, runner_name: str) -> str:
     return path
 
 
-def push_file(local_path: str, remote_name: str | None = None) -> str:
+def push_file(
+    local_path: str, remote_name: str | None = None, serial: str | None = None
+) -> str:
     """Copy a file to the device work directory and return its remote path."""
     remote_path = f"{DEVICE_WORK_DIR}/{remote_name or os.path.basename(local_path)}"
-    run_adb("push", local_path, remote_path)
+    run_adb("push", local_path, remote_path, serial=serial)
     return remote_path
 
 
-def prepare_work_dir() -> None:
-    run_adb("shell", "mkdir", "-p", DEVICE_WORK_DIR)
+def pull_file(remote_path: str, local_path: str, serial: str | None = None) -> str:
+    """Copy a file back from the device."""
+    parent = os.path.dirname(local_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    run_adb("pull", remote_path, local_path, serial=serial)
+    return local_path
 
 
-def push_runner(local_runner_path: str) -> str:
+def remove_remote_files(pattern: str, serial: str | None = None) -> None:
+    """Delete files in the device work directory. Never fails the run."""
+    run_adb(
+        "shell", f"rm -f {DEVICE_WORK_DIR}/{pattern}", check=False, serial=serial
+    )
+
+
+def prepare_work_dir(serial: str | None = None) -> None:
+    run_adb("shell", "mkdir", "-p", DEVICE_WORK_DIR, serial=serial)
+
+
+def push_runner(local_runner_path: str, serial: str | None = None) -> str:
     """Push a runner binary and make it executable on the device."""
-    remote_path = push_file(local_runner_path)
-    run_adb("shell", "chmod", "+x", remote_path)
+    remote_path = push_file(local_runner_path, serial=serial)
+    run_adb("shell", "chmod", "+x", remote_path, serial=serial)
     return remote_path
 
 
-def run_on_device(shell_command: str) -> None:
+def run_on_device(shell_command: str, serial: str | None = None) -> None:
     """Run a shell command on the device, raising on a non-zero exit."""
+    command = ["adb"]
+    if serial:
+        command += ["-s", serial]
+    command += ["shell", f"{shell_command}; echo DD_EXIT=$?"]
     completed = subprocess.run(
-        ["adb", "shell", f"{shell_command}; echo DD_EXIT=$?"],
+        command,
         capture_output=True,
         text=True,
         check=True,
@@ -170,15 +212,15 @@ def run_on_device(shell_command: str) -> None:
         )
 
 
-def read_executorch_logcat() -> str:
+def read_executorch_logcat(serial: str | None = None) -> str:
     """Return the ExecuTorch log lines currently in logcat.
 
     The Android build of ExecuTorch logs through the Android logging system
     rather than stdout, so the runner's per-iteration timings have to be read
     back from logcat rather than captured from the shell command.
     """
-    return run_adb("logcat", "-d")
+    return run_adb("logcat", "-d", serial=serial)
 
 
-def clear_logcat() -> None:
-    run_adb("logcat", "-c")
+def clear_logcat(serial: str | None = None) -> None:
+    run_adb("logcat", "-c", serial=serial)
