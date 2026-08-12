@@ -16,18 +16,23 @@ license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.13"
 
 # Pinned to the exact stack this project was validated against.
-#   executorch 1.4.0 pulls torch 2.13.0 itself.
-#   torchvision and segmentation_models_pytorch are needed by the built-in
-#   `delegate-doctor doctor unet` demo. They are ordinary dependencies rather
-#   than an optional extra so that the documented install path is enough to run
-#   the primary demonstration without hunting down a ModuleNotFoundError.
+# executorch 1.4.0 pulls torch 2.13.0 itself, and that is the whole of the
+# core runtime requirement: DelegateDoctor analyzes an ExportedProgram and has
+# no model zoo of its own.
 dependencies = [
     "executorch==1.4.0",
-    "torchvision==0.28.0",
-    "segmentation_models_pytorch==0.5.0",
 ]
 
 [project.optional-dependencies]
+# The demonstration scripts in examples/ build real models, so they need real
+# model libraries. The core package imports none of these - a regression test
+# asserts that - which is why they are an extra rather than a dependency.
+examples = [
+    "torchvision==0.28.0",
+    "segmentation_models_pytorch==0.5.0",
+]
+# The test suite only. DelegateDoctor itself has no optional backends: no AI,
+# no remote services, no credentials.
 dev = [
     "pytest>=8.0",
 ]

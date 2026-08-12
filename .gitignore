@@ -8,6 +8,19 @@ build/
 dist/
 .pytest_cache/
 
+# Secrets. DelegateDoctor uses no API key, account or remote service of any
+# kind, but a developer's machine still has secrets on it, and these must never
+# be committed.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+.netrc
+
 # Editors / OS
 .idea/
 .vscode/

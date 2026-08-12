@@ -8,13 +8,18 @@ A note on where in the pipeline things happen, because it matters:
 
     torch.nn.Module
         -> torch.export.export(...)      produces an ExportedProgram (ATen ops)
+        -> torch.export.save(...)        model.pt2, DelegateDoctor's input
         -> to_edge_transform_and_lower() runs the XNNPACK partitioner
         -> to_executorch()               produces the .pte bytes
 
-DD-001 rewrites the graph at the **ExportedProgram** stage, before lowering.
-That is the last point where the graph is still ordinary ATen operators that we
-can safely edit. Once a .pte exists the delegated regions are opaque compiled
-blobs, so DelegateDoctor cannot repair a .pte file directly.
+DelegateDoctor joins at the third line: it is handed an ExportedProgram, either
+loaded from a `.pt2` or exported in-process by a built-in demo. `export_to_aten`
+is what the demos use to get there.
+
+The repair rules rewrite the graph at the **ExportedProgram** stage, before
+lowering. That is the last point where the graph is still ordinary ATen
+operators that we can safely edit. Once a .pte exists the delegated regions are
+opaque compiled blobs, so DelegateDoctor cannot repair a .pte file directly.
 """
 
 from __future__ import annotations
@@ -32,13 +37,24 @@ from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 class ModelSpec:
     """Everything DelegateDoctor needs to know about a model to work on it.
 
-    Example modules build and return one of these. Keeping it in a small
-    dataclass means an example file never has to import the rest of the tool.
+    The graph, not a `torch.nn.Module`, is the unit of work: a user's model
+    arrives as a serialized `ExportedProgram` (`model.pt2`) and the built-in
+    demos export themselves into the same object. Nothing downstream needs the
+    original Python.
+
+    Treat `exported_program` as the **pristine baseline**. It is the reference
+    for correctness verification, so the pipeline lowers and repairs deep copies
+    of it and never mutates this one.
     """
 
     name: str
-    model: torch.nn.Module
-    example_inputs: Tuple[torch.Tensor, ...]
+    exported_program: torch.export.ExportedProgram
+
+    # The arguments the program is called with, in `torch.export` terms. They
+    # are frozen for the whole run so the baseline execution, host verification,
+    # device verification and the benchmark all compare identical values.
+    example_args: Tuple = ()
+    example_kwargs: dict = field(default_factory=dict)
 
     # Dimension to take an argmax over during numerical verification. For a
     # segmentation model this is the class dimension, so "argmax agreement"
@@ -48,6 +64,18 @@ class ModelSpec:
 
     # Free-text description shown in the report header.
     description: str = ""
+
+    def call_baseline(self):
+        """Run the pristine graph on the frozen arguments.
+
+        The reference every gate is measured against. Uses `.module()` rather
+        than any original `nn.Module`, so a `.pt2` and a live model produce this
+        the same way.
+        """
+        with torch.no_grad():
+            return self.exported_program.module()(
+                *self.example_args, **self.example_kwargs
+            )
 
 
 @dataclass
@@ -63,7 +91,10 @@ class ExportResult:
 def export_to_aten(model: torch.nn.Module, example_inputs) -> torch.export.ExportedProgram:
     """Trace the model into an ExportedProgram of ATen operators.
 
-    This is the graph DD-001 inspects and rewrites.
+    Used by the built-in demo catalog, which owns the models it builds. The
+    public API in `api.py` exports the *caller's* model and is careful not to
+    mutate it; this is the internal shortcut for models we constructed
+    ourselves moments earlier.
     """
     model = model.eval()
     return torch.export.export(model, example_inputs, strict=True)
@@ -95,16 +126,6 @@ def write_pte(edge_program_manager, pte_path: str) -> str:
     with open(pte_path, "wb") as pte_file:
         executorch_program.write_to_file(pte_file)
     return pte_path
-
-
-def export_and_lower(
-    model: torch.nn.Module,
-    example_inputs,
-    pte_path: str,
-) -> ExportResult:
-    """Run the whole export pipeline for a model that needs no repair."""
-    exported_program = export_to_aten(model, example_inputs)
-    return lower_and_write(exported_program, pte_path)
 
 
 def lower_and_write(

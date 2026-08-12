@@ -604,6 +604,8 @@ def setup_android_runners(
     print(f"  {benchmark_destination}")
     print(f"  {benchmark_description}")
     print(f"\nExecuTorch source cached in {source_dir}")
-    print("It is only needed to rebuild the runners; `doctor` does not read it.")
-    print("\nNext:\n    delegate-doctor doctor unet")
+    print("It is only needed to rebuild the runners; analysis does not read it.")
+    print("\nNext:\n"
+          "    python examples/<model>.py                          # a demo\n"
+          "    delegate-doctor optimize model.pt2 --inputs inputs.pt")
     return 0

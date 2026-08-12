@@ -1,32 +1,71 @@
-"""Demo workload: DeepLabV3+ with a MobileNetV2 encoder, 21 classes.
+"""DeepLabV3+ with a MobileNetV2 encoder, 21 classes - atrous separable convolutions.
 
-Architecture:  DeepLabV3+ (atrous spatial pyramid pooling with a decoder)
-Encoder:       mobilenet_v2 (encoder_weights=None)
-Classes:       21 (Pascal VOC)
-Input:         1 x 3 x 256 x 256
-Activation:    softmax2d  ->  nn.Softmax(dim=1) inside smp's head
+    python examples/deeplabv3plus.py
 
-This model is NOT part of DelegateDoctor. It is a real architecture to point the
-tool at, which is why it lives outside the package.
+Nothing here is DelegateDoctor-specific. This file builds a stock
+`segmentation_models_pytorch` DeepLabV3+ and hands it to the same public
+`optimize()` that any user calls:
 
+    from delegate_doctor import optimize
+    optimize(model, args=(example_input,))
+
+DelegateDoctor has no idea what a DeepLabV3+ is. It exports whatever model it is
+given and analyzes the resulting graph.
+
+Why this model is interesting
+-----------------------------
 The fallback DD-001 repairs is not planted here. `activation="softmax2d"` is a
-documented `segmentation_models_pytorch` constructor argument, and the library
-implements it as `nn.Softmax(dim=1)` on the full-resolution
-(1, 21, 256, 256) class tensor. XNNPACK only delegates a last-dimension softmax,
-so the pattern appears naturally.
+documented smp constructor argument, and the library implements it as
+`nn.Softmax(dim=1)` on the full-resolution (1, 21, 256, 256) class tensor.
+XNNPACK only delegates a last-dimension softmax, so the pattern appears through
+this architecture's own decoder.
 
-Run:  delegate-doctor doctor deeplabv3plus
+`encoder_weights=None` keeps the example offline and deterministic. Graph
+structure and latency do not depend on the weight values, and no claim is made
+about segmentation accuracy.
+
+This is the configuration the recorded DD-001 evidence was measured with; see
+results/dd001_segmentation_generalization.md.
 """
 
-from delegate_doctor.export_model import ModelSpec
-from delegate_doctor.models import build_model_spec, create_deeplabv3plus
+import segmentation_models_pytorch as smp
+import torch
+
+from delegate_doctor import optimize
+
+ENCODER = "mobilenet_v2"
+CLASSES = 21                 # Pascal VOC
+INPUT_SHAPE = (1, 3, 256, 256)
+
+# Segmentation output is (batch, classes, height, width), so the class dimension
+# is 1. Verification uses it to check every pixel keeps its predicted class.
+CLASS_DIMENSION = 1
 
 
-def create_model():
-    """The bare DeepLabV3+, if you want it without DelegateDoctor's wrapper."""
-    return create_deeplabv3plus()
+def build_model():
+    """A stock smp DeepLabV3+, built exactly as the recorded evidence was."""
+    torch.manual_seed(0)
+    return smp.DeepLabV3Plus(
+        encoder_name=ENCODER,
+        encoder_weights=None,
+        in_channels=3,
+        classes=CLASSES,
+        activation="softmax2d",     # -> nn.Softmax(dim=1) in smp's head
+    )
 
 
-def build_model() -> ModelSpec:
-    """What `delegate-doctor doctor deeplabv3plus` loads."""
-    return build_model_spec("deeplabv3plus")
+if __name__ == "__main__":
+    model = build_model()
+    model.eval()
+
+    example_input = torch.randn(*INPUT_SHAPE, dtype=torch.float32)
+
+    result = optimize(
+        model,
+        args=(example_input,),
+        argmax_dim=CLASS_DIMENSION,
+    )
+
+    # Opens the self-contained HTML report in the developer's browser. The
+    # analysis is already complete and saved; this only displays it.
+    result.open_report()

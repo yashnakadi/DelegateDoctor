@@ -67,6 +67,12 @@ from torch.export import ExportedProgram
 RULE_ID = "DD-001"
 RULE_TITLE = "non-last-dimension softmax"
 
+# Presentation metadata only: the node sequence the HTML report draws as a
+# before/after diagram. Nothing reads these during detection or rewriting, and
+# a rule that omits them simply gets no diagram.
+FLOW_BEFORE = ("softmax(dim=D)",)
+FLOW_AFTER = ("view", "permute", "softmax(dim=-1)", "permute", "view")
+
 # torch.export leaves softmax as the composite `aten.softmax.int`; it is only
 # decomposed into `aten._softmax.default` later, inside to_edge. Matching both
 # means the rule works whichever stage it is handed.

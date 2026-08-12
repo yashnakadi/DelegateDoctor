@@ -1,132 +1,12 @@
-"""Tests for model selection and the concise console output.
+"""The concise console output.
 
-Offline: model *construction* is mocked where the real smp import would be slow,
-except for a couple of checks that genuinely need the built module. No adb,
-device, NDK, network or runner binaries.
+Offline: no adb, device, NDK, network or runner binaries. These exercise the
+formatters directly with small fake result objects.
 """
 
-import os
-
 import pytest
-import torch
 
-from delegate_doctor import models, reporting
-from delegate_doctor.cli import BUILTIN_EXAMPLES, load_model_spec
-
-
-# --- the six model names ---------------------------------------------------
-
-def test_all_six_model_names_are_available():
-    assert models.MODEL_NAMES == [
-        "unet", "unetplusplus", "fpn", "pspnet", "deeplabv3plus", "linknet",
-        "ghostnet",
-    ]
-
-
-def test_every_model_name_has_a_builtin_example_file():
-    for name in models.MODEL_NAMES:
-        assert name in BUILTIN_EXAMPLES, name
-        assert os.path.isfile(BUILTIN_EXAMPLES[name]), BUILTIN_EXAMPLES[name]
-
-
-def test_every_model_name_maps_to_its_own_architecture(monkeypatch):
-    """create_model dispatches to a distinct smp class per name."""
-    built = []
-
-    class FakeArchitecture:
-        def __init__(self, cls_name):
-            self.cls_name = cls_name
-
-        def __call__(self, **kwargs):
-            built.append((self.cls_name, kwargs))
-            return torch.nn.Identity()
-
-    class FakeSmp:
-        Unet = FakeArchitecture("Unet")
-        UnetPlusPlus = FakeArchitecture("UnetPlusPlus")
-        FPN = FakeArchitecture("FPN")
-        PSPNet = FakeArchitecture("PSPNet")
-        DeepLabV3Plus = FakeArchitecture("DeepLabV3Plus")
-        Linknet = FakeArchitecture("Linknet")
-
-    import sys
-
-    monkeypatch.setitem(sys.modules, "segmentation_models_pytorch", FakeSmp)
-
-    for name in models.MODEL_NAMES:
-        if name in models.CLASSIFIER_NAMES:
-            continue                      # ghostnet comes from timm, not smp
-        models.create_model(name)
-
-    assert [cls for cls, _ in built] == [
-        "Unet", "UnetPlusPlus", "FPN", "PSPNet", "DeepLabV3Plus", "Linknet",
-    ]
-
-
-def test_every_model_uses_the_validated_configuration(monkeypatch):
-    """mobilenet_v2, 21 classes, softmax2d, no pretrained weights - for all six."""
-    captured = []
-
-    class FakeArchitecture:
-        def __call__(self, **kwargs):
-            captured.append(kwargs)
-            return torch.nn.Identity()
-
-    class FakeSmp:
-        Unet = UnetPlusPlus = FPN = PSPNet = DeepLabV3Plus = Linknet = FakeArchitecture()
-
-    import sys
-
-    monkeypatch.setitem(sys.modules, "segmentation_models_pytorch", FakeSmp)
-
-    segmentation = [n for n in models.MODEL_NAMES if n not in models.CLASSIFIER_NAMES]
-    for name in segmentation:
-        models.create_model(name)
-
-    assert len(captured) == len(segmentation)
-    for kwargs in captured:
-        assert kwargs["encoder_name"] == "mobilenet_v2"
-        assert kwargs["encoder_weights"] is None      # never downloads
-        assert kwargs["in_channels"] == 3
-        assert kwargs["classes"] == 21
-        assert kwargs["activation"] == "softmax2d"    # -> nn.Softmax(dim=1)
-
-
-def test_unknown_model_name_is_rejected():
-    with pytest.raises(ValueError) as caught:
-        models.create_model("resnet")
-    assert "Unknown model" in str(caught.value)
-
-
-def test_unknown_cli_target_lists_the_available_models():
-    with pytest.raises(SystemExit) as caught:
-        load_model_spec("resnet")
-    message = str(caught.value)
-    assert "Unknown model: resnet" in message
-    for name in models.MODEL_NAMES:
-        assert name in message
-
-
-# --- display metadata ------------------------------------------------------
-
-def test_display_names_are_distinct_and_not_all_unet():
-    names = [models.DISPLAY_NAMES[n] for n in models.MODEL_NAMES]
-    assert names == ["U-Net", "U-Net++", "FPN", "PSPNet", "DeepLabV3+", "Linknet",
-                     "GhostNet-100"]
-    assert len(set(names)) == len(names)
-
-
-def test_model_spec_name_identifies_architecture_and_encoder(monkeypatch):
-    monkeypatch.setattr(models, "create_model", lambda name: torch.nn.Identity())
-    spec = models.build_model_spec("pspnet")
-    assert spec.name == "PSPNet / MobileNetV2"
-    assert spec.argmax_dim == 1
-    assert tuple(spec.example_inputs[0].shape) == (1, 3, 256, 256)
-    assert "softmax2d" in spec.description
-
-
-def test_input_shape_text():
-    assert models.input_shape_text() == "1x3x256x256"
+from delegate_doctor import reporting
 
 
 # --- concise console output ------------------------------------------------
@@ -272,3 +152,99 @@ def test_rejected_decision_still_explains_why():
     text = reporting.format_decision(FakeDecision(), "RMX2030")
     assert "REJECTED" in text
     assert "did not verify" in text
+
+
+# --- the concise terminal summary -------------------------------------------
+
+# Imported under aliases: this module already defines its own FakeVerification
+# for the formatter tests above, and shadowing it would silently change them.
+from delegate_doctor import result as result_module          # noqa: E402
+from tests.test_html_report import (                          # noqa: E402
+    FakeDelegation as _FakeDelegation,
+    FakeDetection as _FakeDetection,
+    accepted_result,
+    build,
+    healthy_result,
+)
+
+
+def summary_of(outcome) -> str:
+    return reporting.format_summary(outcome)
+
+
+def test_the_summary_is_short():
+    """The console default has to fit in a glance, not a scrollback."""
+    lines = [line for line in summary_of(accepted_result()).splitlines()
+             if line.strip()]
+    assert len(lines) <= 12, lines
+
+
+def test_the_summary_names_the_model_and_the_essentials():
+    text = summary_of(accepted_result())
+    assert "DelegateDoctor - PSPNet" in text
+    for label in ("Result", "Top hotspot", "Runtime delegation", "Latency",
+                  "Speedup", "Correctness", "Report"):
+        assert label in text, f"summary is missing {label}"
+
+
+def test_the_summary_reports_the_decision_and_numbers():
+    text = summary_of(accepted_result())
+    assert "REPAIR ACCEPTED" in text
+    assert "242.69 -> 65.53 ms" in text
+    assert "3.70x" in text
+    assert "34.3% -> 99.4%" in text
+    assert "PASS host / PASS device" in text
+
+
+def test_a_healthy_summary_says_so_without_fake_numbers():
+    text = summary_of(healthy_result())
+    assert "FULLY DELEGATED" in text
+    assert "Portable hotspots       none" in text
+    assert "not required" in text
+    assert "Speedup" not in text
+    assert "Latency" not in text
+
+
+def test_a_static_summary_does_not_imply_measurement():
+    outcome = build(result_module.ANALYSIS_COMPLETE,
+                    before_delegation=_FakeDelegation(total=41, portable=1),
+                    detections={"DD-001": _FakeDetection()})
+    outcome.record(result_module.DEVICE, result_module.UNAVAILABLE, "no target")
+    text = summary_of(outcome)
+    assert "ANALYSIS COMPLETE" in text
+    assert "Operator delegation" in text
+    assert "Device                  unavailable" in text
+    assert "Runtime profiling       not run" in text
+    assert "Repair candidate        DD-001" in text
+    assert "Latency" not in text
+    assert "Speedup" not in text
+
+
+def test_a_lowering_failure_summary_names_executorch():
+    outcome = build(result_module.EXECUTORCH_LOWERING_UNSUPPORTED)
+    outcome.record(result_module.LOWERING, "FAILED",
+                   "RuntimeError: edge dialect rejected aten.exotic")
+    text = summary_of(outcome)
+    assert "EXECUTORCH LOWERING UNSUPPORTED" in text
+    assert "lowering failed" in text
+    assert "aten.exotic" in text
+
+
+def test_the_summary_points_at_the_html_report():
+    outcome = accepted_result()
+    outcome.report_path = "/tmp/run_042/report.html"
+    assert "Report                  /tmp/run_042/report.html" in summary_of(outcome)
+
+
+def test_the_summary_shows_the_optimized_artifact_only_when_there_is_one():
+    accepted = accepted_result()
+    assert "Optimized model" in summary_of(accepted)
+    assert "Optimized model" not in summary_of(healthy_result())
+
+
+def test_no_terminal_output_contains_emoji():
+    for outcome in (accepted_result(), healthy_result()):
+        for character in summary_of(outcome):
+            code = ord(character)
+            assert not (0x1F000 <= code <= 0x1FAFF)
+            assert not (0x2600 <= code <= 0x27BF)

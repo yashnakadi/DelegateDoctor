@@ -50,6 +50,11 @@ from torch.export import ExportedProgram
 RULE_ID = "DD-002"
 RULE_TITLE = "no-op alias"
 
+# Presentation metadata only: the node sequence the HTML report draws as a
+# before/after diagram. Nothing reads these during detection or rewriting.
+FLOW_BEFORE = ("producer", "alias", "consumer")
+FLOW_AFTER = ("producer", "consumer")
+
 # `aten.alias` is what torch.export emits; `alias_copy` is its functional form,
 # which is what survives into the edge dialect. Match either.
 ALIAS_TARGETS = (

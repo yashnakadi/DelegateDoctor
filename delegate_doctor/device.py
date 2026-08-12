@@ -104,7 +104,7 @@ def require_device() -> DeviceInfo:
         raise DeviceError(
             "No Arm64 Android target is attached.\n"
             "\n"
-            "`doctor` runs the model on a real Arm64 target, so it needs a device\n"
+            "DelegateDoctor runs the model on a real Arm64 target, so it needs a device\n"
             "or emulator visible to adb. Check with:\n"
             "\n"
             "    adb devices\n"

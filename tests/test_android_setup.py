@@ -436,7 +436,7 @@ def test_cli_reports_setup_errors_without_a_traceback(monkeypatch, capsys):
     assert "git is not installed" in capsys.readouterr().err
 
 
-def test_doctor_without_runners_points_at_setup_android(tmp_path):
+def test_a_missing_runner_points_at_setup_android(tmp_path):
     """The missing-runner message must name the command that fixes it."""
     with pytest.raises(device.DeviceError) as caught:
         device.find_runner(str(tmp_path), device.BENCH_RUNNER_NAME)

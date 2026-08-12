@@ -1,31 +1,64 @@
-"""Demo workload: timm GhostNet-100, an ImageNet classifier.
+"""timm GhostNet-100, an ImageNet classifier - the DD-002 demonstration.
 
-Architecture:  GhostNet-100 (from timm)
-Task:          ImageNet classification, 1000 classes
-Input:         1 x 3 x 224 x 224
-Weights:       pretrained=False
+    python examples/ghostnet.py
 
-This model is NOT part of DelegateDoctor. It is the DD-002 demonstration, and it
-deliberately comes from a different codebase and a different task than the six
-segmentation examples.
+Nothing here is DelegateDoctor-specific. This file builds a stock timm
+GhostNet-100 and hands it to the same public `optimize()` that any user calls:
 
+    from delegate_doctor import optimize
+    optimize(model, args=(example_input,))
+
+Deliberately a different codebase and a different task from the six
+segmentation examples: the same unchanged DelegateDoctor analyzes both, because
+it has no architecture-specific code for either.
+
+Why this model is interesting
+-----------------------------
 The fallback is not planted. timm's `GhostModule.forward` ends with
 `out[:, :self.out_chs, :, :]`; when that slice covers the whole tensor it
 exports as `aten.alias`, a pure no-op. XNNPACK has no config for alias, so all
-32 of them drop out of the delegate and split the graph into 49 blobs.
+32 of them drop out of the delegate and split the graph into 49 blobs - which is
+exactly the pattern DD-002 removes.
 
-Run:  delegate-doctor doctor ghostnet
+`pretrained=False` keeps the example offline and deterministic. Graph structure
+and latency do not depend on the weight values, and no claim is made about
+classification accuracy.
+
+This is the configuration the recorded DD-002 evidence was measured with; see
+results/dd002_emulator_validation.md.
 """
 
-from delegate_doctor.export_model import ModelSpec
-from delegate_doctor.models import build_model_spec, create_ghostnet
+import timm
+import torch
+
+from delegate_doctor import optimize
+
+MODEL = "ghostnet_100"
+INPUT_SHAPE = (1, 3, 224, 224)
+
+# ImageNet logits are (batch, 1000), so an argmax over dim 1 is top-1 - the
+# meaningful semantic check for a classifier.
+CLASS_DIMENSION = 1
 
 
-def create_model():
-    """The bare GhostNet, without DelegateDoctor's wrapper."""
-    return create_ghostnet()
+def build_model():
+    """A stock timm GhostNet-100, built exactly as the recorded evidence was."""
+    torch.manual_seed(0)
+    return timm.create_model(MODEL, pretrained=False)
 
 
-def build_model() -> ModelSpec:
-    """What `delegate-doctor doctor ghostnet` loads."""
-    return build_model_spec("ghostnet")
+if __name__ == "__main__":
+    model = build_model()
+    model.eval()
+
+    example_input = torch.randn(*INPUT_SHAPE, dtype=torch.float32)
+
+    result = optimize(
+        model,
+        args=(example_input,),
+        argmax_dim=CLASS_DIMENSION,
+    )
+
+    # Opens the self-contained HTML report in the developer's browser. The
+    # analysis is already complete and saved; this only displays it.
+    result.open_report()

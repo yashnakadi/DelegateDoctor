@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
 
 
 def _heading(title: str) -> str:
@@ -37,6 +36,191 @@ def format_header(model_name: str, input_shape: str, target_description: str) ->
         f"Input:  {input_shape}\n"
         f"Device: {target_description}\n"
         f"Backend: ExecuTorch + XNNPACK"
+    )
+
+
+def format_summary(outcome) -> str:
+    """The whole run in a handful of aligned lines.
+
+    This is what the console shows by default. Everything longer lives in
+    report.txt and report.html, which are easier to read than a scrollback
+    buffer anyway. Only measured values appear here - a stage that did not run
+    contributes no line rather than a zero.
+    """
+    from .result import (DEVICE, EXECUTORCH_LOWERING_UNSUPPORTED, LOWERING,
+                         NOT_RUN, PASS, PROFILING)
+
+    lines = [f"\nDelegateDoctor - {outcome.model_name or 'PyTorch Model'}", ""]
+
+    def row(label: str, value: str) -> None:
+        lines.append(f"{label:<24}{value}")
+
+    row("Result", outcome.status.replace("_", " "))
+
+    if outcome.stage_status(LOWERING) == "FAILED":
+        stage = outcome.stage(LOWERING)
+        row("ExecuTorch", "lowering failed")
+        if stage and stage.detail:
+            row("Cause", stage.detail.splitlines()[0][:70])
+    elif outcome.before_profile is not None:
+        profile = outcome.before_profile
+        hotspots = profile.portable_kernels
+        if hotspots:
+            top = hotspots[0]
+            row("Top hotspot",
+                f"{top.operator_name} · {_percent(top.runtime_fraction)} runtime")
+        else:
+            row("Portable hotspots", "none")
+
+        if outcome.after_profile is not None:
+            row("Runtime delegation",
+                f"{_percent(profile.runtime_delegation_fraction)} -> "
+                f"{_percent(outcome.after_profile.runtime_delegation_fraction)}")
+        else:
+            row("Runtime delegation",
+                _percent(profile.runtime_delegation_fraction))
+    else:
+        # No profiling: report what static analysis established, and be plain
+        # about the device rather than implying a measurement.
+        if outcome.before_delegation is not None:
+            row("Operator delegation",
+                _percent(outcome.before_delegation.operator_delegation_fraction))
+        device_stage = outcome.stage(DEVICE)
+        if device_stage is not None and device_stage.status != PASS:
+            row("Device", device_stage.status.lower())
+        if outcome.stage_status(PROFILING) == NOT_RUN:
+            row("Runtime profiling", "not run")
+
+    if outcome.benchmark is not None:
+        row("Latency", f"{outcome.benchmark.before.p50_ms:.2f} -> "
+                       f"{outcome.benchmark.after.p50_ms:.2f} ms")
+        row("Speedup", f"{outcome.benchmark.p50_speedup:.2f}x")
+
+    if outcome.host_verification is not None:
+        device_text = ("" if outcome.device_verification is None
+                       else f" host / {outcome.device_verification.status_text} device")
+        row("Correctness",
+            outcome.host_verification.status_text + device_text)
+
+    if outcome.repairs_applied:
+        row("Repair applied", ", ".join(sorted(outcome.repairs_applied)))
+    elif outcome.repair_available:
+        row("Repair candidate",
+            ", ".join(sorted(rule_id for rule_id, found
+                             in outcome.detections.items() if found.applies)))
+    elif outcome.status != EXECUTORCH_LOWERING_UNSUPPORTED:
+        row("Repair", "not required" if outcome.status in (
+            "FULLY_DELEGATED", "NO_REPAIR_REQUIRED") else "none available")
+
+    lines.append("")
+    if outcome.output_pte:
+        row("Optimized model", outcome.output_pte)
+    row("Report", outcome.report_path or outcome.run_dir)
+    return "\n".join(lines)
+
+
+def format_pipeline(stages) -> str:
+    """How far the model got, stage by stage.
+
+    Printed on every run, including the ones that stopped early. A stage that
+    did not run says so; nothing here ever prints PASS for work not done.
+    """
+    text = _heading("PIPELINE") + "\n"
+    text += "-" * 40 + "\n"
+    for stage in stages:
+        # Every stage is listed, including the ones that never ran. Silence
+        # would leave the reader guessing which of them were skipped.
+        text += f"{stage.name:<28}{stage.status}\n"
+        if stage.detail:
+            text += f"  {stage.detail}\n"
+    return text
+
+
+def format_result(outcome) -> str:
+    """The final RESULT block: what this run concluded."""
+    text = _heading("RESULT") + "\n"
+    text += "-" * 40 + "\n"
+    text += f"{outcome.status}\n{outcome.summary}\n"
+    return text
+
+
+def format_lowering_failure(model_name, error, executorch_version) -> str:
+    """Export succeeded; ExecuTorch declined the graph. Say precisely that."""
+    return (
+        f"\nEXECUTORCH LOWERING\nFAILED\n"
+        f"\n"
+        f"DelegateDoctor captured and inspected the PyTorch ExportedProgram, but\n"
+        f"ExecuTorch could not lower the graph into a runnable program. This is a\n"
+        f"limitation of the ExecuTorch deployment path for this model, not a\n"
+        f"failure of the model or of torch.export.\n"
+        f"\n"
+        f"  Model:      {model_name}\n"
+        f"  ExecuTorch: {executorch_version}\n"
+        f"\n"
+        f"Cause:\n"
+        f"{type(error).__name__}: {str(error)[:900]}\n"
+    )
+
+
+def format_static_analysis(delegation_report, detections, device_status,
+                           reason: str, matched=None) -> str:
+    """Everything that could be measured without running on the device."""
+    text = _heading("DELEGATION") + "\n"
+    text += "-" * 40 + "\n"
+    text += (
+        f"{delegation_report.total_ops} ops · "
+        f"{delegation_report.delegated_op_total} delegated · "
+        f"{delegation_report.portable_op_total} portable · "
+        f"{delegation_report.delegate_blob_count} blob(s)\n"
+        f"Operator delegation: "
+        f"{_percent(delegation_report.operator_delegation_fraction)}\n"
+    )
+
+    text += _heading("ANDROID EXECUTION") + f"\n{device_status}\n"
+    if reason:
+        text += f"\nReason:\n{reason}\n"
+    text += (
+        "\nRuntime profiling, verification and benchmarking need the device, so\n"
+        "no runtime numbers are reported. Static analysis above is complete.\n"
+    )
+
+    if matched:
+        text += _heading("REPAIR") + "\n"
+        text += f"{', '.join(matched)} pattern(s) matched in this graph.\n"
+        text += (
+            "Not applied: a repair is only accepted after it verifies and\n"
+            "benchmarks faster on the target, and the device was not available.\n"
+        )
+    text += format_declined_repairs(detections)
+    return text
+
+
+def format_declined_repairs(detections) -> str:
+    """Rules that saw their pattern but would not rewrite it.
+
+    Recognising a pattern and being willing to repair it are different things -
+    DD-001 declines dynamic shapes, for instance - and the difference is worth
+    printing rather than hiding behind "no repair available".
+    """
+    lines = []
+    for rule_id, found in sorted(detections.items()):
+        for skipped in getattr(found, "skipped", []):
+            lines.append(f"  {rule_id}  {skipped.node_name}: {skipped.reason}")
+    if not lines:
+        return ""
+    return (_heading("CANDIDATE PATTERNS NOT REPAIRED") + "\n"
+            + "\n".join(lines) + "\n")
+
+
+def format_unverifiable(reason: str) -> str:
+    """A repair we cannot check is a repair we cannot keep."""
+    return (
+        f"\nCORRECTNESS VERIFICATION\nUNSUPPORTED\n"
+        f"\n"
+        f"Reason:\n{reason}\n"
+        f"\n"
+        f"DelegateDoctor will not accept a repair it cannot verify, so no\n"
+        f"repaired artifact was produced. The analysis above still stands.\n"
     )
 
 
