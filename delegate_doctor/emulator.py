@@ -48,13 +48,30 @@ SYSTEM_IMAGE_PACKAGE = (
 NDK_VERSION = "27.2.12479018"
 NDK_PACKAGE = f"ndk;{NDK_VERSION}"
 
-# Everything needed to create and run the managed AVD.
-EMULATOR_PACKAGES = (
+# Two package sets, because they cost very different amounts.
+#
+# COMMON is what a *physical* arm64-v8a phone needs, plus what the runner build
+# needs: adb to talk to the device, and the pinned NDK to cross-compile. Both
+# are small and both are unavoidable.
+#
+# EMULATOR is the rest, and it is dominated by the system image - a multi-
+# gigabyte download. It used to sit in the same list, so `setup-android`
+# fetched it on every machine, including the many that have a phone plugged in
+# and will never start an emulator. It is now reached only through
+# `setup-android --emulator`.
+COMMON_PACKAGES = (
     "platform-tools",
+    NDK_PACKAGE,
+)
+
+EMULATOR_PACKAGES = (
     "emulator",
     f"platforms;android-{ANDROID_API_LEVEL}",
     SYSTEM_IMAGE_PACKAGE,
 )
+
+# The one package whose download deserves a warning of its own.
+LARGE_PACKAGES = frozenset({SYSTEM_IMAGE_PACKAGE})
 
 # Launch flags, kept together so their effect on measurement is reviewable.
 #   -no-window / -no-audio  headless; neither touches CPU scheduling
@@ -173,7 +190,20 @@ def install_packages(environment: AndroidEnvironment, packages: list,
         raise EmulatorError("sdkmanager is not available.")
 
     for package in packages:
-        announce(f"  installing {package}")
+        if package in LARGE_PACKAGES:
+            # Said before the wait, not after it. sdkmanager can sit silent for
+            # minutes on this one, and a user with no warning reasonably
+            # concludes DelegateDoctor has hung.
+            announce("")
+            announce("Installing Arm64 Android emulator image...")
+            announce("")
+            announce(f"  Package: {package}")
+            announce("")
+            announce("  This is a large download and may take several minutes.")
+            announce("  sdkmanager's own progress output follows.")
+            announce("")
+        else:
+            announce(f"  installing {package}")
         result = run_tool(sdkmanager, ["--install", package],
                           timeout=60 * 60)
         if not result.ok:

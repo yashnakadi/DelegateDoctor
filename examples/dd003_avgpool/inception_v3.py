@@ -1,3 +1,14 @@
+"""DD-003: nine avg_pool2d fallbacks worth ~60% of measured runtime.
+
+PRETRAINED WEIGHTS, deliberately. The first run downloads a checkpoint from the
+PyTorch hub.
+
+Unlike the other examples this one keeps its trained weights, because the
+recorded DD-003 evidence was measured with them and the numbers in the README
+would not be reproducible otherwise. A randomly initialised Inception also
+produces logits around 1e10, where fp32 comparisons stop meaning anything.
+"""
+
 import torch
 from torchvision.models import Inception_V3_Weights, inception_v3
 

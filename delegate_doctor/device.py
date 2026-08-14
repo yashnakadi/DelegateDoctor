@@ -14,11 +14,23 @@ Two separate runner binaries are used on purpose:
 
 Both are the stock ExecuTorch `executor_runner`, cross-compiled for arm64-v8a.
 See the README for the exact CMake commands.
+
+Finding adb
+-----------
+Every adb call in DelegateDoctor goes through `run_adb` or `run_on_device`
+below, and both resolve the executable through `resolve_adb()` rather than
+invoking a bare `adb` and hoping the shell can find it.
+
+That distinction is not cosmetic. A fresh Android Studio install puts adb at
+`<sdk>/platform-tools/adb` and does *not* add it to PATH, so a user with a
+working SDK and a connected phone was told "No Arm64 Android target is
+attached" - a device problem reported for a PATH problem.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 
@@ -32,6 +44,84 @@ ETDUMP_RUNNER_NAME = "executor_runner_etdump"
 
 class DeviceError(RuntimeError):
     """Raised when the Arm target or its tooling is not usable."""
+
+
+class AdbNotFound(DeviceError):
+    """No adb executable at all - which is not the same as no device.
+
+    A subclass rather than a sibling so every existing `except DeviceError`
+    still behaves exactly as it did; callers that want to tell the two apart
+    now can, and callers that do not are unaffected.
+    """
+
+
+# Resolved once per process. adb does not move while DelegateDoctor runs, and
+# re-resolving would re-read the SDK layout on every push, pull and getprop.
+_resolved_adb: str | None = None
+
+
+def resolve_adb(path_lookup=None) -> str | None:
+    """The adb executable DelegateDoctor will actually run, or None.
+
+    Resolution order, chosen so setup and execution always agree on one SDK:
+
+        1. `<sdk>/platform-tools/adb` for the SDK found by the documented
+           discovery order - ANDROID_HOME, ANDROID_SDK_ROOT, then the standard
+           Android Studio location for this platform
+        2. `adb` on PATH, only when the step above finds nothing
+
+    The SDK copy wins a tie on purpose: a PATH hit can belong to an unrelated
+    Android installation, and provisioning one SDK while talking to another is
+    the kind of mismatch that produces impossible bug reports.
+    """
+    global _resolved_adb
+    if _resolved_adb is not None:
+        return _resolved_adb
+
+    # Looked up at call time rather than bound as a default, so a caller - or a
+    # test - can substitute the PATH search.
+    path_lookup = path_lookup or shutil.which
+
+    # Imported here rather than at module scope: `device` is imported by the
+    # hot path, and SDK discovery touches the filesystem.
+    from . import android_environment
+
+    tool = android_environment.detect(path_lookup=path_lookup).tool("adb")
+    if tool.found:
+        _resolved_adb = str(tool.path)
+        return _resolved_adb
+
+    on_path = path_lookup("adb")
+    if on_path:
+        _resolved_adb = str(on_path)
+        return _resolved_adb
+    return None
+
+
+def reset_adb_cache() -> None:
+    """Forget the resolved adb. For tests, and for a run that just installed it."""
+    global _resolved_adb
+    _resolved_adb = None
+
+
+def require_adb() -> str:
+    """The resolved adb, or a message that names the real problem."""
+    adb = resolve_adb()
+    if adb is None:
+        raise AdbNotFound(ADB_MISSING_MESSAGE)
+    return adb
+
+
+ADB_MISSING_MESSAGE = (
+    "adb was not found.\n"
+    "\n"
+    "This is not a device problem: DelegateDoctor could not find the Android\n"
+    "Platform-Tools at all, so it has no way to look for a device.\n"
+    "\n"
+    "Install Android Studio and complete its initial Setup Wizard, then run:\n"
+    "\n"
+    "    delegate-doctor setup-android"
+)
 
 
 @dataclass
@@ -76,7 +166,7 @@ def run_adb(*args: str, check: bool = True, serial: str | None = None) -> str:
     safer than relying on adb's implicit choice, which fails or picks the wrong
     device as soon as a second target appears.
     """
-    command = ["adb"]
+    command = [require_adb()]
     if serial:
         command += ["-s", serial]
     command += list(args)
@@ -85,10 +175,10 @@ def run_adb(*args: str, check: bool = True, serial: str | None = None) -> str:
             command, capture_output=True, text=True, check=check
         )
     except FileNotFoundError:
-        raise DeviceError(
-            "adb was not found on PATH. Install the Android platform tools, e.g.\n"
-            "  brew install --cask android-platform-tools"
-        )
+        # The executable resolved a moment ago and has since gone. Rare, but
+        # the honest message is still "no adb", not "no device".
+        reset_adb_cache()
+        raise AdbNotFound(ADB_MISSING_MESSAGE)
     return completed.stdout
 
 
@@ -205,7 +295,7 @@ def push_runner(local_runner_path: str, serial: str | None = None) -> str:
 
 def run_on_device(shell_command: str, serial: str | None = None) -> None:
     """Run a shell command on the device, raising on a non-zero exit."""
-    command = ["adb"]
+    command = [require_adb()]
     if serial:
         command += ["-s", serial]
     command += ["shell", f"{shell_command}; echo DD_EXIT=$?"]

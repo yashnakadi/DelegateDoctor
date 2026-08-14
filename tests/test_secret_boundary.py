@@ -190,9 +190,11 @@ def test_the_sentinel_never_appears_in_child_argv(planted_secrets, monkeypatch):
     argv = " ".join(recorded["argv"])
     assert SENTINEL not in argv
     assert SENTINEL_TWO not in argv
-    # argv is built only from the caller's arguments.
-    assert recorded["argv"] == ["adb", "-s", "abc", "shell", "getprop",
-                                "ro.product.model"]
+    # argv is built only from the caller's arguments, after the executable.
+    # argv[0] is the resolved adb (an SDK path, or "adb" when only PATH has
+    # one), so the caller-supplied tail is what this pins.
+    assert recorded["argv"][1:] == ["-s", "abc", "shell", "getprop",
+                                    "ro.product.model"]
 
 
 def test_no_package_module_interpolates_an_environment_value_into_a_command():

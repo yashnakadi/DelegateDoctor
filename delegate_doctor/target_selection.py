@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .device import DeviceError, DeviceInfo, run_adb
+from .device import AdbNotFound, DeviceError, DeviceInfo, run_adb
 
 REQUIRED_ABI = "arm64-v8a"
 
@@ -130,6 +130,79 @@ def discover_targets() -> list:
             continue
         targets.append(probe_target(serial))
     return targets
+
+
+# --- what setup needs to know about physical devices ------------------------
+#
+# Setup asks a narrower question than `select_target`: is a *phone* ready, and
+# if not, exactly what is wrong? "No device" and "device attached but you never
+# accepted the USB debugging prompt" need different sentences, and reporting
+# either as the other wastes the user's time.
+
+PHYSICAL_READY = "READY"
+PHYSICAL_NONE = "NONE"
+PHYSICAL_UNAUTHORIZED = "UNAUTHORIZED"
+PHYSICAL_OFFLINE = "OFFLINE"
+PHYSICAL_WRONG_ABI = "WRONG_ABI"
+PHYSICAL_NO_ADB = "NO_ADB"
+
+
+@dataclass
+class PhysicalDeviceStatus:
+    """Whether a physical arm64-v8a phone is usable right now, and why not."""
+
+    status: str
+    target: Optional[Target] = None
+    detail: str = ""
+
+    @property
+    def ready(self) -> bool:
+        return self.status == PHYSICAL_READY
+
+
+def physical_device_status() -> PhysicalDeviceStatus:
+    """Classify the attached physical devices for the setup summary.
+
+    Built on `list_adb_serials` and `probe_target` rather than a second
+    discovery implementation, so setup and `optimize` always see the same
+    adb, the same serials and the same properties.
+    """
+    try:
+        serials = list_adb_serials()
+    except DeviceError as error:
+        # AdbNotFound is a DeviceError, and it is the one case that must not be
+        # reported as "no device attached".
+        if isinstance(error, AdbNotFound):
+            return PhysicalDeviceStatus(PHYSICAL_NO_ADB, detail=str(error))
+        return PhysicalDeviceStatus(PHYSICAL_NONE, detail=str(error))
+
+    unauthorized = [serial for serial, state in serials if state == "unauthorized"]
+    offline = [serial for serial, state in serials if state == "offline"]
+
+    physical = []
+    for serial, state in serials:
+        if state != "device":
+            continue
+        target = probe_target(serial)
+        if not target.is_emulator:
+            physical.append(target)
+
+    ready = [target for target in physical if target.usable]
+    if ready:
+        return PhysicalDeviceStatus(PHYSICAL_READY, target=ready[0])
+
+    if physical:
+        wrong = physical[0]
+        return PhysicalDeviceStatus(
+            PHYSICAL_WRONG_ABI, target=wrong,
+            detail=wrong.info.abi or "unknown")
+
+    if unauthorized:
+        return PhysicalDeviceStatus(PHYSICAL_UNAUTHORIZED,
+                                    detail=", ".join(unauthorized))
+    if offline:
+        return PhysicalDeviceStatus(PHYSICAL_OFFLINE, detail=", ".join(offline))
+    return PhysicalDeviceStatus(PHYSICAL_NONE)
 
 
 def usable_targets(targets: list) -> list:

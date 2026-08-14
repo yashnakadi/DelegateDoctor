@@ -90,10 +90,19 @@ def test_the_avd_name_is_a_single_constant():
 
 
 def test_the_required_packages_are_explicit():
+    """Two sets, split by cost.
+
+    The system image is a multi-gigabyte download, so it belongs only to the
+    emulator path - plain `setup-android` must be able to finish without it.
+    """
+    assert emulator.COMMON_PACKAGES == (
+        "platform-tools", emulator.NDK_PACKAGE,
+    )
     assert emulator.EMULATOR_PACKAGES == (
-        "platform-tools", "emulator", "platforms;android-35",
+        "emulator", "platforms;android-35",
         "system-images;android-35;google_apis;arm64-v8a",
     )
+    assert emulator.SYSTEM_IMAGE_PACKAGE not in emulator.COMMON_PACKAGES
 
 
 def test_the_ndk_is_pinned_not_latest():

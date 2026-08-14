@@ -662,13 +662,69 @@ def ensure_licenses(environment, interactive: bool, announce=print,
         environment, announce=announce, prompt=prompt)
 
 
+def _install_missing(environment, packages, interactive: bool, assume_yes: bool,
+                     announce=print, prompt=input) -> bool:
+    """Install whichever of `packages` are absent, with licences and consent.
+
+    Shared by the common and emulator paths so the two cannot drift apart on
+    licence handling or on what "the user said no" means.
+    """
+    try:
+        missing = emulator.missing_packages(environment, required=packages)
+    except emulator.EmulatorError as error:
+        announce(f"\nCould not inspect Android packages: {error}")
+        return False
+
+    if not missing:
+        return True
+
+    announce("\nMissing Android components:\n")
+    for package in missing:
+        announce(f"  {package}")
+    if not ensure_licenses(environment, interactive, announce, prompt):
+        return False
+    if not _confirm("\nInstall now?", interactive, assume_yes, prompt):
+        announce("\nSkipped. Install them yourself with:\n")
+        for package in missing:
+            announce(f"  sdkmanager --install \"{package}\"")
+        return False
+
+    emulator.install_packages(environment, missing, announce=announce)
+    # adb may have just appeared. Anything that resolved it earlier in this
+    # process would otherwise keep the old "not found" answer.
+    device.reset_adb_cache()
+    return True
+
+
+def provision_common(environment, interactive: bool, assume_yes: bool,
+                     announce=print, prompt=input) -> bool:
+    """The packages both paths need: platform-tools and the pinned NDK.
+
+    Deliberately small. This is what runs on `delegate-doctor setup-android`
+    with no flags, and it must not pull the emulator system image - a
+    multi-gigabyte download that a user with a phone plugged in will never use.
+    """
+    if not environment.has_sdk:
+        announce("\n" + android_environment.SDK_MISSING_MESSAGE)
+        return False
+    if not environment.has_command_line_tools:
+        announce("\n" + android_environment.COMMAND_LINE_TOOLS_MISSING_MESSAGE)
+        return False
+    return _install_missing(environment, emulator.COMMON_PACKAGES,
+                            interactive, assume_yes, announce, prompt)
+
+
 def provision_emulator(environment, interactive: bool, assume_yes: bool,
                        announce=print, prompt=input) -> bool:
     """Install emulator packages and create the managed AVD, with consent.
 
-    Returns True when the AVD is present afterwards. A host that cannot give a
-    meaningful Arm emulator is told so plainly and skipped - DelegateDoctor
-    will not substitute an x86_64 image.
+    Reached only through `setup-android --emulator`. Returns True when the AVD
+    is present afterwards. A host that cannot give a meaningful Arm emulator is
+    told so plainly and skipped - DelegateDoctor will not substitute an x86_64
+    image.
+
+    Host support is checked *before* the system image is requested, so an
+    unsupported host is told in a second rather than after a long download.
     """
     support = environment.emulator_support
     if support == android_environment.SUPPORT_UNAVAILABLE:
@@ -687,26 +743,9 @@ def provision_emulator(environment, interactive: bool, assume_yes: bool,
     if support == android_environment.SUPPORT_UNTESTED:
         announce("\nNOTE: " + environment.emulator_support_reason + "\n")
 
-    try:
-        missing = emulator.missing_packages(environment)
-    except emulator.EmulatorError as error:
-        # sdkmanager is present but unusable. Report it and carry on: the
-        # runner build below does not depend on the emulator at all.
-        announce(f"\nCould not inspect Android packages: {error}")
+    if not _install_missing(environment, emulator.EMULATOR_PACKAGES,
+                            interactive, assume_yes, announce, prompt):
         return False
-
-    if missing:
-        announce("\nMissing Android components:\n")
-        for package in missing:
-            announce(f"  {package}")
-        if not ensure_licenses(environment, interactive, announce, prompt):
-            return False
-        if not _confirm("\nInstall now?", interactive, assume_yes, prompt):
-            announce("\nSkipped. Install them yourself with:\n")
-            for package in missing:
-                announce(f"  sdkmanager --install \"{package}\"")
-            return False
-        emulator.install_packages(environment, missing, announce=announce)
 
     if emulator.avd_exists(environment):
         compatible, reason = emulator.avd_is_compatible(environment)
@@ -740,6 +779,7 @@ def setup_android_runners(
     parallel_jobs: int = 10,
     interactive: bool = False,
     assume_yes: bool = False,
+    setup_emulator: bool = False,
     skip_emulator: bool = False,
     announce=print,
     prompt=input,
@@ -748,6 +788,12 @@ def setup_android_runners(
 
     Ordered so nothing expensive happens before the environment is understood.
     Idempotent: a second run reports FOUND/READY and exits quickly.
+
+    `setup_emulator` is the `--emulator` opt-in. Without it this provisions
+    only what a physical arm64-v8a phone and the runner build need, and the
+    emulator system image is never downloaded. `skip_emulator` is kept so an
+    existing script that passed it keeps meaning "never touch the emulator";
+    it is now the default.
     """
     # 1. Look at everything first.
     installed_version = check_executorch_version()
@@ -762,15 +808,22 @@ def setup_android_runners(
         announce(format_verdict(runners_dir, environment))
         return 2
 
-    # 3. Offer the emulator, when this host can give a meaningful one.
-    if not skip_emulator:
+    # 3. The packages both paths need. Small, and never the system image.
+    provision_common(environment, interactive, assume_yes,
+                     announce=announce, prompt=prompt)
+
+    # 4. The emulator only when explicitly asked for. Its system image is a
+    #    multi-gigabyte download, and the fast path is a phone on USB.
+    if setup_emulator and not skip_emulator:
         try:
             provision_emulator(environment, interactive, assume_yes,
                                announce=announce, prompt=prompt)
         except emulator.EmulatorError as error:
-            announce(f"\nEmulator provisioning skipped: {error}")
+            # The common environment is still fine. Say so, rather than letting
+            # a failed optional download read as a broken setup.
+            announce(format_emulator_failure(str(error)))
 
-    # 3. The toolchain the runner build needs.
+    # 5. The toolchain the runner build needs.
     check_command("git", "Install git and try again.")
     check_command(
         "cmake",
@@ -782,7 +835,7 @@ def setup_android_runners(
     if not rebuild and runners_already_installed(runners_dir):
         announce(f"Runners: {runners_dir}")
         announce("Re-run with --rebuild to build them again.")
-        announce(format_verdict(runners_dir))
+        _report_closing(setup_emulator, runners_dir, announce)
         return 0
 
     announce(f"\nAndroid NDK:          {ndk_dir}")
@@ -828,8 +881,143 @@ def setup_android_runners(
     print(f"  {benchmark_description}")
     print(f"\nExecuTorch source cached in {source_dir}")
     print("It is only needed to rebuild the runners; analysis does not read it.")
-    announce(format_verdict(runners_dir))
+    _report_closing(setup_emulator, runners_dir, announce)
     return 0
+
+
+def _report_closing(setup_emulator: bool, runners_dir, announce) -> None:
+    """The last thing setup prints, matched to what the user actually asked for.
+
+    `--emulator` gets the managed-environment verdict, because that is the
+    question it was run to answer.
+
+    Plain setup gets the physical-device summary. It gets the emulator verdict
+    only when the emulator happens to be ready anyway - printing
+    "Managed Arm64 environment UNAVAILABLE - the AVD does not exist" after a
+    successful default run would report the deliberate absence of an
+    unrequested component as a failure.
+    """
+    from . import target_selection
+
+    if setup_emulator:
+        announce(format_verdict(runners_dir))
+        return
+
+    try:
+        status = target_selection.physical_device_status()
+    except Exception as error:                          # pragma: no cover
+        announce(f"\n(Could not check for a device: {type(error).__name__})")
+        return
+    announce(format_physical_device_summary(status))
+
+    try:
+        if managed_environment_ready(Path(runners_dir),
+                                     android_environment.detect()):
+            announce(format_verdict(runners_dir))
+    except Exception:                                   # pragma: no cover
+        pass
+
+
+def format_emulator_failure(reason: str) -> str:
+    """An optional download failed. The common environment is still fine.
+
+    Kept separate from the runner-build failures on purpose: a user whose
+    system image did not download has a working physical-device setup, and
+    telling them their environment is broken would be false.
+    """
+    return (
+        f"\nArm64 emulator image    FAILED\n"
+        f"\n"
+        f"Common Android environment is ready.\n"
+        f"\n"
+        f"Could not install:\n"
+        f"  {emulator.SYSTEM_IMAGE_PACKAGE}\n"
+        f"\n"
+        f"{reason.strip()}\n"
+        f"\n"
+        f"You can retry:\n"
+        f"\n"
+        f"    delegate-doctor setup-android --emulator\n"
+        f"\n"
+        f"Or connect a physical arm64-v8a Android device:\n"
+        f"\n"
+        f"    delegate-doctor optimize model.py --target device"
+    )
+
+
+def format_physical_device_summary(status) -> str:
+    """The closing block of plain `setup-android`: is a phone ready?
+
+    Every branch distinguishes what is actually wrong. "adb is missing" and
+    "no phone is plugged in" are different problems with different fixes, and
+    reporting either as the other sends the user looking in the wrong place.
+    """
+    from . import target_selection
+
+    if status.status == target_selection.PHYSICAL_NO_ADB:
+        return (
+            "\nADB                     NOT FOUND\n"
+            "\n"
+            "Android SDK Platform-Tools is missing, so DelegateDoctor cannot\n"
+            "look for a device at all.\n"
+            "\n"
+            "Install Android Studio, complete its initial Setup Wizard, then\n"
+            "run this again."
+        )
+
+    if status.status == target_selection.PHYSICAL_READY:
+        target = status.target
+        return (
+            f"\nArm64 device            PASS    "
+            f"{target.display_name} · {target.info.abi}\n"
+            f"\n"
+            f"Physical-device environment READY\n"
+            f"\n"
+            f"    delegate-doctor optimize model.py --target device"
+        )
+
+    if status.status == target_selection.PHYSICAL_UNAUTHORIZED:
+        return (
+            f"\nAndroid device          UNAUTHORIZED    {status.detail}\n"
+            f"\n"
+            f"Unlock the phone and accept the USB debugging authorization\n"
+            f"prompt, then run this again."
+        )
+
+    if status.status == target_selection.PHYSICAL_OFFLINE:
+        return (
+            f"\nAndroid device          OFFLINE    {status.detail}\n"
+            f"\n"
+            f"Reconnect the cable, or restart adb, then run this again."
+        )
+
+    if status.status == target_selection.PHYSICAL_WRONG_ABI:
+        return (
+            f"\nAndroid device          UNSUPPORTED\n"
+            f"ABI                     {status.detail}\n"
+            f"Required                {target_selection.REQUIRED_ABI}\n"
+            f"\n"
+            f"DelegateDoctor measures Arm64 only, and the runners are\n"
+            f"cross-compiled for {target_selection.REQUIRED_ABI}."
+        )
+
+    return (
+        "\nArm64 device            NOT FOUND\n"
+        "\n"
+        "Common Android environment ready.\n"
+        "\n"
+        "No physical arm64-v8a Android device is currently available.\n"
+        "\n"
+        "Connect a physical Android device and run:\n"
+        "\n"
+        "    delegate-doctor optimize model.py --target device\n"
+        "\n"
+        "Or create DelegateDoctor's managed Arm64 emulator:\n"
+        "\n"
+        "    delegate-doctor setup-android --emulator\n"
+        "\n"
+        "Emulator setup downloads a large Android Arm64 system image."
+    )
 
 
 def format_verdict(runners_dir: Path, environment=None) -> str:

@@ -531,14 +531,28 @@ def main(argv: Optional[list] = None) -> int:
         "setup-android",
         help="provision the Arm64 Android environment and build the runners",
         description=(
-            "Prepare everything DelegateDoctor needs to measure on Arm64:\n"
+            "Prepare what DelegateDoctor needs to measure on Arm64.\n"
+            "\n"
+            "Plain setup targets a PHYSICAL arm64-v8a phone, and is the fast\n"
+            "path:\n"
             "\n"
             "  the Android SDK Android Studio installed - discovered through\n"
             "  ANDROID_HOME, ANDROID_SDK_ROOT or the standard location for\n"
             "  this platform. DelegateDoctor never installs an SDK itself.\n"
-            "  the pinned platform, system image and NDK\n"
-            "  the DelegateDoctor_ARM64 emulator, where the host supports it\n"
+            "  platform-tools (adb) and the pinned NDK\n"
             "  the two cross-compiled ExecuTorch runners\n"
+            "  a check for an attached arm64-v8a device\n"
+            "\n"
+            "It does NOT download the Arm64 emulator system image.\n"
+            "\n"
+            "--emulator additionally provisions the managed emulator:\n"
+            "\n"
+            "  the emulator package and the pinned platform\n"
+            "  system-images;android-35;google_apis;arm64-v8a - a LARGE\n"
+            "  download, typically several gigabytes and several minutes\n"
+            "  the DelegateDoctor_ARM64 AVD, where the host supports it\n"
+            "\n"
+            "Use it when you have no Arm64 phone to hand.\n"
             "\n"
             "Your own AVDs, Android Studio settings and shell profile are "
             "never touched. Running this first is optional - `optimize` can "
@@ -556,8 +570,14 @@ def main(argv: Optional[list] = None) -> int:
                        help="never prompt; report what is missing instead")
     setup.add_argument("--yes", action="store_true",
                        help="install missing Android components without asking")
+    setup.add_argument("--emulator", action="store_true", dest="setup_emulator",
+                       help="also provision the managed Arm64 emulator. This "
+                            "downloads a large Android system image "
+                            "(system-images;android-35;google_apis;arm64-v8a)")
     setup.add_argument("--skip-emulator", action="store_true",
-                       help="only build the runners; do not touch the emulator")
+                       help="deprecated: the emulator is now opt-in via "
+                            "--emulator, so this is the default. Kept so "
+                            "existing scripts keep working")
 
     args = parser.parse_args(argv)
 
@@ -581,6 +601,7 @@ def main(argv: Optional[list] = None) -> int:
                 parallel_jobs=args.jobs,
                 interactive=not args.non_interactive,
                 assume_yes=args.yes,
+                setup_emulator=args.setup_emulator,
                 skip_emulator=args.skip_emulator,
             )
         except android_setup.SetupError as error:

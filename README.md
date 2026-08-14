@@ -203,7 +203,33 @@ A physical arm64-v8a Android device works from any host.
 
 `delegate-doctor check` is a fast local preflight. It reports your Python version, PyTorch, ExecuTorch, NumPy, pandas, the ETDump analysis path, `adb`, and the Android SDK, with a remedy for anything missing. It touches no network, no device and no API key.
 
-`delegate-doctor setup-android` provisions the Arm side: it reuses the SDK Android Studio installed, adds the pinned platform (API 35), the arm64-v8a system image and NDK 27.2.12479018, creates a `DelegateDoctor_ARM64` emulator where the host supports one, and cross-compiles the two ExecuTorch runner binaries. Your own AVDs and Android Studio settings are never modified.
+`delegate-doctor setup-android` provisions the Arm side for a **physical phone**, which is the fast path: it reuses the SDK Android Studio installed, adds `platform-tools` and the pinned NDK 27.2.12479018, cross-compiles the two ExecuTorch runner binaries, and then checks whether an arm64-v8a device is attached. It does **not** download the Arm64 emulator system image. Your own AVDs and Android Studio settings are never modified.
+
+You do not need `adb` on your PATH. DelegateDoctor resolves it from the SDK it discovered — `<sdk>/platform-tools/adb` — and falls back to PATH only if the SDK has none. Android Studio does not put adb on PATH, and a tool that assumed otherwise would report "no device" on a machine with a phone plugged in.
+
+### Connect a phone
+
+With a physical device, `setup-android` finishes with:
+
+```
+Arm64 device            PASS    RMX2030 · arm64-v8a
+
+Physical-device environment READY
+
+    delegate-doctor optimize model.py --target device
+```
+
+Enable Developer options and USB debugging on the phone, then accept the authorization prompt when it appears. If the phone shows as `UNAUTHORIZED` or `OFFLINE`, setup says so specifically rather than reporting it as missing.
+
+### No Android phone?
+
+Setup still succeeds without one — the common environment is what the runner build needs. To measure without a phone, create DelegateDoctor's managed Arm64 emulator on a supported Arm64 host:
+
+```bash
+delegate-doctor setup-android --emulator
+```
+
+This additionally installs the `emulator` package, the pinned platform (API 35) and `system-images;android-35;google_apis;arm64-v8a`, then creates the `DelegateDoctor_ARM64` AVD. **The system image is a large download and takes significantly longer than physical-device setup** — expect several gigabytes and several minutes. Host support is checked before anything is downloaded, so an x86_64 host is told immediately rather than after the wait.
 
 ---
 
@@ -223,7 +249,15 @@ delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulato
 
 The first reports high runtime delegation and no repair required. The second finds nine `avg_pool2d` fallbacks worth about 60% of runtime, repairs them in one candidate, verifies it, benchmarks it, and writes an optimized `.pte`.
 
-Use `--target device` instead of `--target emulator` to measure on a connected phone, or `--target auto` to let DelegateDoctor choose.
+`mobilenet_v2.py` uses random weights and needs no network. `inception_v3.py` downloads a pretrained checkpoint on its first run, because the recorded DD-003 numbers were measured with it.
+
+With a phone attached, use `--target device`:
+
+```bash
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target device
+```
+
+`--target emulator` measures on the managed emulator instead, and `--target auto` lets DelegateDoctor choose — preferring a physical device when both are present.
 
 ---
 
@@ -413,7 +447,7 @@ delegate-doctor optimize examples/no_repair/convnext_small.py --target emulator
 
 **A model file with no interface** — `examples/ai_adapter/densenet121.py` deliberately declares neither `delegate_doctor_model()` nor `delegate_doctor_inputs()`. It exists to demonstrate the case optional AI preparation handles; see below.
 
-The six DD-001 segmentation models need the `examples` extra (`segmentation_models_pytorch`); `ghostnet.py` additionally needs `timm`. `inception_v3.py`, `mobilenet_v2.py` and `convnext_small.py` build with pretrained weights, so their first run downloads a checkpoint from the PyTorch hub; the rest use random weights and need no network.
+The six DD-001 segmentation models need the `examples` extra (`segmentation_models_pytorch`); `ghostnet.py` additionally needs `timm`. Every example builds with random weights and needs no network, except `inception_v3.py`, which downloads a pretrained checkpoint because the recorded DD-003 evidence was measured with it.
 
 ---
 
@@ -480,14 +514,19 @@ This repository contains no measured evidence of an accepted AI repair. The dete
 <details>
 <summary>What <code>setup-android</code> installs</summary>
 
-Into the SDK Android Studio already installed:
+Into the SDK Android Studio already installed. Plain `setup-android`:
 
-- `platforms;android-35`
-- `system-images;android-35;google_apis;arm64-v8a`
+- `platform-tools` (adb)
 - `ndk;27.2.12479018`
+
+With `--emulator`, additionally:
+
+- `emulator`
+- `platforms;android-35`
+- `system-images;android-35;google_apis;arm64-v8a` — the large one
 - an AVD named `DelegateDoctor_ARM64`, only where the host can run arm64-v8a natively
 
-It then fetches the pinned ExecuTorch commit into `.build/` and cross-compiles the two runners into `runners/`. Both directories are git-ignored. `--rebuild` forces a rebuild, `--skip-emulator` builds only the runners, and `--jobs N` controls compile parallelism.
+Either way it then fetches the pinned ExecuTorch commit into `.build/` and cross-compiles the two runners into `runners/`. Both directories are git-ignored. `--rebuild` forces a rebuild and `--jobs N` controls compile parallelism. (`--skip-emulator` still parses, but the emulator is now opt-in, so it is the default.)
 
 </details>
 

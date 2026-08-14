@@ -207,14 +207,34 @@ def _short(error: Exception) -> str:
     return (text[0] if text else type(error).__name__)[:90]
 
 
-def check_adb(path_lookup=shutil.which) -> CheckResult:
-    """`adb`, from the SDK or from PATH. Needed for any device work."""
-    from . import android_environment
+def describe_path(path) -> str:
+    """A path fit to be pasted into an issue: home shortened to `~`.
 
-    environment = android_environment.detect(path_lookup=path_lookup)
-    tool = environment.tool("adb")
-    if tool.found:
-        return CheckResult("ADB", PASS, str(tool.path))
+    Reuses `agent.privacy.redact_home_paths`, which is the existing convention
+    for this, so there is one answer to "how do we show a path" rather than
+    two that can drift.
+    """
+    from .agent.privacy import redact_home_paths
+
+    return redact_home_paths(str(path))
+
+
+def check_adb(path_lookup=shutil.which) -> CheckResult:
+    """The adb DelegateDoctor will actually run - resolved, not assumed.
+
+    This deliberately does not consult PATH first. Android Studio installs adb
+    at `<sdk>/platform-tools/adb` and does not put it on PATH, so a check that
+    asked the shell would report MISSING on a machine that is in fact ready.
+
+    The path is reported through `describe_path`, which shortens the home
+    directory to `~`: `check --verbose` output gets pasted into issues, and it
+    does not need to carry a username.
+    """
+    from . import device
+
+    resolved = device.resolve_adb(path_lookup=path_lookup)
+    if resolved:
+        return CheckResult("ADB", PASS)
     return CheckResult(
         "ADB", MISSING, "",
         remedy=("adb was not found. Install Android Studio, complete its "
@@ -355,10 +375,21 @@ def collect_diagnostics() -> dict:
     try:
         environment = android_environment.detect()
         diagnostics["android sdk"] = str(environment.sdk_root or "not found")
-        for tool in ("adb", "emulator", "sdkmanager", "avdmanager"):
-            diagnostics[tool] = str(environment.tool_path(tool) or "not found")
-        diagnostics["ndk"] = str(environment.ndk or "not found")
-        diagnostics["cmake"] = str(environment.cmake or "not found")
+        # adb comes from the same resolver the device code uses, so --verbose
+        # names the executable that will actually run rather than a second
+        # opinion about where adb might be.
+        from . import device
+
+        resolved_adb = device.resolve_adb()
+        diagnostics["adb"] = (describe_path(resolved_adb) if resolved_adb
+                              else "not found")
+        for tool in ("emulator", "sdkmanager", "avdmanager"):
+            path = environment.tool_path(tool)
+            diagnostics[tool] = describe_path(path) if path else "not found"
+        diagnostics["ndk"] = (describe_path(environment.ndk)
+                              if environment.ndk else "not found")
+        diagnostics["cmake"] = (describe_path(environment.cmake)
+                                if environment.cmake else "not found")
         diagnostics["git"] = str(environment.git or "not found")
     except Exception:                                    # pragma: no cover
         diagnostics["android sdk"] = "could not be inspected"

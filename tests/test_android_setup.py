@@ -394,8 +394,12 @@ def test_setup_reports_completion_when_runners_already_exist(tmp_path, monkeypat
     # Idempotence: both runners are reported READY and nothing was rebuilt.
     assert "ETDump runner          READY" in output
     assert "Benchmark runner       READY" in output
-    assert "Managed Arm64 environment" in output
     assert "--rebuild" in output
+    # Plain setup closes with the physical-device verdict. It does not report
+    # the managed emulator as UNAVAILABLE, because it was never asked to make
+    # one - see test_android_onboarding.py.
+    assert "Arm64 device" in output
+    assert "Managed Arm64 environment   UNAVAILABLE" not in output
 
 
 def test_runners_already_installed_is_false_when_one_is_missing(tmp_path, monkeypatch):
