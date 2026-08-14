@@ -297,13 +297,23 @@ def test_class_change_on_device_fails():
     assert result.argmax_agreement < 1.0
 
 
-def test_device_original_disagreeing_with_host_fails():
-    """A backend that cannot reproduce the host result before any repair."""
+def test_a_backend_that_already_drifts_is_a_warning_not_a_repair_failure():
+    """The Inception V3 case, and the reason this split exists.
+
+    The backend does not reproduce its host result - and did not before the
+    repair either. The repair itself is faithful: both device outputs agree
+    exactly. Blaming the repair for the backend's pre-existing drift is what
+    this used to do.
+    """
     host = make_output()
-    bad_device_original = host + 0.25
-    result = verify(bad_device_original, host.clone(), host, host)
-    assert not result.passed
-    assert any("before the repair" in reason for reason in result.failure_reasons)
+    drift = 0.25
+    result = verify(host + drift, host + drift, host, host)
+
+    assert result.passed, "the repair did not change the device output"
+    assert result.failure_reasons == []
+    assert result.backend_fidelity == device_verification.BACKEND_FIDELITY_WARNING
+    assert result.backend_fidelity_acceptable
+    assert "before any repair" in result.backend_fidelity_reason
 
 
 def test_device_repaired_disagreeing_with_host_fails():
@@ -315,8 +325,60 @@ def test_device_repaired_disagreeing_with_host_fails():
 
     result = verify(device_original, device_repaired, host_original, host_repaired)
 
+    # Repair fidelity: the candidate changed what the device computes.
     assert not result.passed
-    assert any("not on the Android backend" in r for r in result.failure_reasons)
+    assert any("differs from the original" in r for r in result.failure_reasons)
+    # And backend fidelity blames the right party: the original was clean.
+    assert result.backend_fidelity == device_verification.BACKEND_FIDELITY_FAIL
+    assert "the rewrite introduced this" in result.backend_fidelity_reason
+
+
+def test_a_candidate_that_breaks_a_clean_backend_fails():
+    """Original reproduced its host result; the candidate does not."""
+    host_original = make_output(seed=0)
+    # The candidate genuinely computes something different on host and device
+    # alike, so repair fidelity has nothing to say - only backend fidelity does.
+    host_repaired = host_original + 0.5
+    result = verify(host_original.clone(), host_original + 0.5 + 0.4,
+                    host_original, host_repaired)
+
+    assert result.backend_fidelity == device_verification.BACKEND_FIDELITY_FAIL
+    assert not result.backend_fidelity_acceptable
+
+
+def test_a_candidate_dramatically_worse_than_a_drifting_baseline_fails():
+    """A drifting baseline buys the right to be comparable, not arbitrary."""
+    status, reason = device_verification.classify_backend_fidelity(
+        original_error=1.3e-05, candidate_error=1.3e-03)
+    assert status == device_verification.BACKEND_FIDELITY_FAIL
+    assert "materially worse" in reason
+
+
+def test_a_candidate_comparable_to_a_drifting_baseline_warns():
+    """The measured DenseNet169 case: the candidate is slightly better."""
+    status, _ = device_verification.classify_backend_fidelity(
+        original_error=1.252e-05, candidate_error=1.222e-05)
+    assert status == device_verification.BACKEND_FIDELITY_WARNING
+
+
+def test_backend_fidelity_within_tolerance_is_silent():
+    """The measured DenseNet121 case: nothing to report."""
+    status, reason = device_verification.classify_backend_fidelity(
+        original_error=6.44e-06, candidate_error=7.15e-06)
+    assert status == device_verification.BACKEND_FIDELITY_OK
+    assert reason == ""
+
+
+def test_backend_fidelity_never_widens_the_tolerance():
+    """The regression factor decides attribution, never what counts as equal."""
+    from delegate_doctor import verification
+
+    assert verification.MAX_ABSOLUTE_ERROR_TOLERANCE == 1e-5
+    # Just past tolerance with no baseline to excuse it is still a failure,
+    # however small the absolute number is.
+    status, _ = device_verification.classify_backend_fidelity(
+        original_error=0.0, candidate_error=1.01e-05)
+    assert status == device_verification.BACKEND_FIDELITY_FAIL
 
 
 def test_shape_mismatch_fails_before_comparing_values():

@@ -36,6 +36,31 @@ Benchmark integrity
 This runs before or after the timed benchmark, never inside it. The benchmark
 invocation still uses `--print_output none` and writes no tensors, so file I/O
 and adb transfer cannot leak into latency numbers.
+
+Two questions, not one
+----------------------
+Comparing four tensors answers two genuinely different questions, and folding
+them together produced a real misdiagnosis:
+
+    REPAIR FIDELITY     original device output vs candidate device output.
+                        Did the rewrite change what the backend computes?
+                        This is the repair's own gate.
+
+    BACKEND FIDELITY    each model's device output vs its own host output.
+                        How closely does the Android backend reproduce
+                        PyTorch? Measured for the original *and* the
+                        candidate.
+
+Backend fidelity is a property of the model and the backend, not of the
+rewrite. Inception V3's untouched original already diverges 1.29e-05 from its
+host result on an Arm64 emulator - before DelegateDoctor changes anything -
+because fp32 reassociation accumulates across 300+ operators. Reporting that as
+a repair failure blamed the repair for an error that existed before it.
+
+So a baseline discrepancy is a WARNING about the backend. What is still a
+failure is a discrepancy the *candidate introduced*: one that appears where the
+original was clean, or one dramatically worse than the original's. That is the
+conservative half of the old behaviour, kept, without the false accusation.
 """
 
 from __future__ import annotations
@@ -58,6 +83,71 @@ from .verification import (
 # Only fp32 is supported, matching the project's declared scope. The device file
 # is raw bytes, so guessing at any other dtype would silently produce garbage.
 SUPPORTED_DTYPE = torch.float32
+
+# --- backend fidelity ---------------------------------------------------------
+
+BACKEND_FIDELITY_OK = "OK"
+BACKEND_FIDELITY_WARNING = "WARNING"
+BACKEND_FIDELITY_FAIL = "FAIL"
+
+# How much worse than the original's existing drift the candidate's drift may be
+# before it stops being "the same backend behaving the same way" and becomes a
+# regression the repair is responsible for.
+#
+# This is not a numerical tolerance and it does not widen one: the tolerance
+# below which everything is fine is still MAX_ABSOLUTE_ERROR_TOLERANCE. This
+# only decides how to describe a model that was *already* past that line before
+# any repair existed. An order of magnitude is deliberately coarse - the point
+# is to catch "the rewrite broke the backend", not to referee rounding.
+BACKEND_FIDELITY_REGRESSION_FACTOR = 10.0
+
+
+def classify_backend_fidelity(original_error: Optional[float],
+                              candidate_error: Optional[float]) -> tuple:
+    """How well the backend reproduces the host, and whose fault any gap is.
+
+    Returns `(status, reason)`. The order of these branches is the policy:
+
+        candidate within tolerance          -> OK, nothing to say
+        original within tolerance,
+          candidate outside it              -> FAIL, the repair introduced it
+        candidate >> original               -> FAIL, materially worse
+        both outside, candidate comparable  -> WARNING, pre-existing drift
+
+    Note the third branch has no escape hatch for "the baseline already failed":
+    a candidate an order of magnitude worse than an already-drifting original is
+    still a regression. What the baseline buys is the right to be *comparable*,
+    not the right to be arbitrary.
+    """
+    if original_error is None or candidate_error is None:
+        return BACKEND_FIDELITY_OK, ""
+
+    if candidate_error <= MAX_ABSOLUTE_ERROR_TOLERANCE:
+        return BACKEND_FIDELITY_OK, ""
+
+    if original_error <= MAX_ABSOLUTE_ERROR_TOLERANCE:
+        return BACKEND_FIDELITY_FAIL, (
+            f"the repaired model's device output differs from its host output "
+            f"by {candidate_error:.3e}, above the tolerance of "
+            f"{MAX_ABSOLUTE_ERROR_TOLERANCE:g}, while the original model stayed "
+            f"within it ({original_error:.3e}); the rewrite introduced this"
+        )
+
+    if candidate_error > BACKEND_FIDELITY_REGRESSION_FACTOR * original_error:
+        return BACKEND_FIDELITY_FAIL, (
+            f"the repaired model's device-vs-host difference of "
+            f"{candidate_error:.3e} is more than "
+            f"{BACKEND_FIDELITY_REGRESSION_FACTOR:g}x the original model's "
+            f"{original_error:.3e}; the rewrite made backend fidelity "
+            f"materially worse"
+        )
+
+    return BACKEND_FIDELITY_WARNING, (
+        f"this model does not reproduce its host result on this backend even "
+        f"before any repair (original {original_error:.3e}, repaired "
+        f"{candidate_error:.3e}, tolerance "
+        f"{MAX_ABSOLUTE_ERROR_TOLERANCE:g}); the repair is not the cause"
+    )
 BYTES_PER_ELEMENT = 4
 
 # `--output_file NAME` makes the runner write NAME-<output index>.bin.
@@ -229,13 +319,17 @@ def capture_device_output(
 class DeviceVerificationResult:
     """Outcome of comparing the tensors the Android device actually produced."""
 
+    # REPAIR fidelity only: did the rewrite change what the device computes?
+    # Backend fidelity is reported alongside and never folded in here.
     passed: bool
     # repaired vs original, both measured on the device: the main question
     repaired_vs_original: Optional[ErrorMetrics] = None
     argmax_agreement: Optional[float] = None
-    # device vs host for each model: distinguishes "bad repair" from "bad backend"
+    # device vs host for each model: how well the backend reproduces PyTorch
     original_device_vs_host: Optional[ErrorMetrics] = None
     repaired_device_vs_host: Optional[ErrorMetrics] = None
+    backend_fidelity: str = BACKEND_FIDELITY_OK
+    backend_fidelity_reason: str = ""
     failure_reasons: list = None
     error: str = ""
 
@@ -247,6 +341,17 @@ class DeviceVerificationResult:
     def status_text(self) -> str:
         return "PASS" if self.passed else "FAIL"
 
+    @property
+    def backend_fidelity_acceptable(self) -> bool:
+        """A warning is acceptable; a regression the repair caused is not."""
+        return self.backend_fidelity != BACKEND_FIDELITY_FAIL
+
+    @property
+    def backend_fidelity_max_error(self) -> Optional[float]:
+        if self.original_device_vs_host is None:
+            return None
+        return self.original_device_vs_host.max_absolute_error
+
     def to_dict(self) -> dict:
         def metrics_or_none(metrics):
             return metrics.to_dict() if metrics is not None else None
@@ -257,6 +362,9 @@ class DeviceVerificationResult:
             "argmax_agreement": self.argmax_agreement,
             "original_device_vs_host": metrics_or_none(self.original_device_vs_host),
             "repaired_device_vs_host": metrics_or_none(self.repaired_device_vs_host),
+            "backend_fidelity": self.backend_fidelity,
+            "backend_fidelity_reason": self.backend_fidelity_reason,
+            "backend_fidelity_acceptable": self.backend_fidelity_acceptable,
             "failure_reasons": self.failure_reasons,
             "error": self.error,
         }
@@ -271,18 +379,19 @@ def verify_device_outputs(
 ) -> DeviceVerificationResult:
     """Compare the device tensors, using the same thresholds as host verification.
 
-    Three checks, all of which must pass:
+    Two questions, answered separately (see the module docstring):
 
-      1. repaired vs original, both on the device - the repair itself;
-      2. original device vs original host - does the Android backend already
-         disagree with the host before we changed anything?
-      3. repaired device vs repaired host - did the rewrite trigger a
-         device-specific bug?
+      * `passed` - repair fidelity. Shape, repaired vs original on the device,
+        and argmax agreement. This is the repair's gate.
+      * `backend_fidelity` - how closely the backend reproduces the host, for
+        the original and for the candidate, classified by
+        `classify_backend_fidelity`.
 
-    Checks 2 and 3 are what separate "the repair is wrong" from "the backend is
-    wrong", and either failing is treated as a correctness failure. That is the
-    conservative choice: a device that does not reproduce its own host result is
-    not a device whose speedup we should trust.
+    Checks 2 and 3 used to be folded into `passed`, which meant a model whose
+    untouched original already drifted past tolerance had every repair rejected
+    and reported as the repair's fault. Both comparisons are still made, still
+    against the same unchanged tolerance, and a regression the candidate
+    introduced is still a failure - it is now attributed correctly.
     """
     # Note the thresholds and metric helpers come straight from verification.py:
     # host and device share one correctness policy, never two.
@@ -314,25 +423,20 @@ def verify_device_outputs(
             f"of {MAX_ABSOLUTE_ERROR_TOLERANCE:g}"
         )
 
+    # Backend fidelity, measured for both models and judged on its own terms.
+    # These two comparisons are deliberately NOT appended to failure_reasons:
+    # `passed` answers "did the repair change the result", and a backend that
+    # never reproduced its host result cannot be evidence about a rewrite.
     original_device_vs_host = compute_error_metrics(
         original_device_output, original_host_output
     )
-    if original_device_vs_host.max_absolute_error > MAX_ABSOLUTE_ERROR_TOLERANCE:
-        failure_reasons.append(
-            f"the original model's device output differs from its host output by "
-            f"{original_device_vs_host.max_absolute_error:.3e}; the Android "
-            f"backend does not reproduce the host result even before the repair"
-        )
-
     repaired_device_vs_host = compute_error_metrics(
         repaired_device_output, repaired_host_output
     )
-    if repaired_device_vs_host.max_absolute_error > MAX_ABSOLUTE_ERROR_TOLERANCE:
-        failure_reasons.append(
-            f"the repaired model's device output differs from its host output by "
-            f"{repaired_device_vs_host.max_absolute_error:.3e}; the rewrite looks "
-            f"correct on the host but not on the Android backend"
-        )
+    backend_fidelity, backend_fidelity_reason = classify_backend_fidelity(
+        original_device_vs_host.max_absolute_error,
+        repaired_device_vs_host.max_absolute_error,
+    )
 
     argmax_agreement = None
     if argmax_dim is not None:
@@ -352,6 +456,8 @@ def verify_device_outputs(
         argmax_agreement=argmax_agreement,
         original_device_vs_host=original_device_vs_host,
         repaired_device_vs_host=repaired_device_vs_host,
+        backend_fidelity=backend_fidelity,
+        backend_fidelity_reason=backend_fidelity_reason,
         failure_reasons=failure_reasons,
     )
 

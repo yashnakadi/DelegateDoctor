@@ -6,6 +6,7 @@ point of keeping it in its own module.
 """
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -573,3 +574,95 @@ def test_the_report_path_is_a_plain_string_field():
     outcome.report_path = "/tmp/run_001/report.html"
     assert str(outcome.report_path).endswith("report.html")
     assert outcome.to_dict()["report_path"] == "/tmp/run_001/report.html"
+
+
+# --- the CLI opens it by default ---------------------------------------------
+
+class _ResolvedStub:
+    """Stands in for a resolved model path when only dispatch is under test."""
+
+    path = Path("model.py")
+    kind = "python"
+    from_workspace = False
+
+
+class _FakeOutcome:
+    """Stands in for a completed run when only report-opening is under test."""
+
+    status = result_module.ANALYSIS_COMPLETE
+
+    def __init__(self):
+        self.opened = 0
+
+    def open_report(self):
+        self.opened += 1
+        return True
+
+
+@pytest.fixture
+def cli_run(monkeypatch, tmp_path):
+    """Run the CLI down to the report step without touching a model or device."""
+    from delegate_doctor import cli
+
+    outcome = _FakeOutcome()
+    monkeypatch.setattr(cli.model_source, "resolve_model_input",
+                        lambda target, root=".": _ResolvedStub())
+    monkeypatch.setattr(cli, "ensure_target_available",
+                        lambda *args, **kwargs: True)
+    monkeypatch.setattr(cli, "prepare_model_source",
+                        lambda path, **kwargs: object())
+    monkeypatch.setattr(cli.pipeline, "run_optimization",
+                        lambda spec, **options: outcome)
+    return cli, outcome
+
+
+def test_a_normal_cli_run_opens_the_report(cli_run):
+    """The developer just watched a device benchmark; show them the result."""
+    cli, outcome = cli_run
+    assert cli.main(["optimize", "model.py"]) == 0
+    assert outcome.opened == 1
+
+
+def test_no_open_report_writes_it_without_opening_it(cli_run):
+    cli, outcome = cli_run
+    assert cli.main(["optimize", "model.py", "--no-open-report"]) == 0
+    assert outcome.opened == 0
+
+
+def test_a_non_interactive_run_never_opens_a_browser(cli_run):
+    """A CI job launching a browser is a surprise, not a convenience."""
+    cli, outcome = cli_run
+    assert cli.main(["optimize", "model.py", "--non-interactive"]) == 0
+    assert outcome.opened == 0
+
+
+def test_the_python_api_never_opens_a_browser_on_its_own(monkeypatch):
+    """optimize() runs inside other people's programs. It stays quiet."""
+    from delegate_doctor import result as result_mod
+
+    monkeypatch.setattr(result_mod.webbrowser, "open",
+                        lambda url: pytest.fail("the API opened a browser"))
+    outcome = accepted_result()
+    outcome.report_path = None
+    assert outcome.open_report() is False
+
+
+def test_a_browser_failure_does_not_change_the_cli_exit_code(monkeypatch):
+    """Opening the report is a courtesy; it cannot fail a completed analysis."""
+    from delegate_doctor import cli
+
+    class Refusing(_FakeOutcome):
+        def open_report(self):
+            raise RuntimeError("no display")
+
+    outcome = Refusing()
+    monkeypatch.setattr(cli.model_source, "resolve_model_input",
+                        lambda target, root=".": _ResolvedStub())
+    monkeypatch.setattr(cli, "ensure_target_available",
+                        lambda *args, **kwargs: True)
+    monkeypatch.setattr(cli, "prepare_model_source",
+                        lambda path, **kwargs: object())
+    monkeypatch.setattr(cli.pipeline, "run_optimization",
+                        lambda spec, **options: outcome)
+
+    assert cli.main(["optimize", "model.py"]) == 0

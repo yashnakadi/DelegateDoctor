@@ -391,8 +391,11 @@ def test_setup_reports_completion_when_runners_already_exist(tmp_path, monkeypat
 
     assert exit_code == 0
     output = capsys.readouterr().out
-    assert "already exists" in output
-    assert "setup is complete" in output
+    # Idempotence: both runners are reported READY and nothing was rebuilt.
+    assert "ETDump runner          READY" in output
+    assert "Benchmark runner       READY" in output
+    assert "Managed Arm64 environment" in output
+    assert "--rebuild" in output
 
 
 def test_runners_already_installed_is_false_when_one_is_missing(tmp_path, monkeypatch):
@@ -411,7 +414,7 @@ def test_cli_dispatches_setup_android(monkeypatch):
 
     calls = []
 
-    def record(project_root, runners_dir, rebuild, parallel_jobs):
+    def record(project_root, runners_dir, rebuild, parallel_jobs, **options):
         calls.append({"rebuild": rebuild, "jobs": parallel_jobs})
         return 0
 

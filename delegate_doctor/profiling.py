@@ -35,7 +35,6 @@ portable kernel burned the time, which is what turns a number into a hotspot.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import List
 
@@ -57,12 +56,32 @@ ACCOUNTING_TOLERANCE_FRACTION = 0.05
 
 @dataclass
 class PortableKernel:
-    """One portable (non-delegated) kernel and what it cost."""
+    """One portable (non-delegated) kernel and what it cost.
+
+    `total_ms` aggregates every place this operator ran, which is the right
+    number for *reporting*: "layer norm costs 10.1% of runtime" is a fact about
+    the model. It is the wrong number for *targeting*, because a repair is
+    applied to one graph node and a model can contain twenty-four layer norms.
+
+    So the per-site costs are kept alongside the total. Each entry is one
+    instruction site's own p50, in execution order - ExecuTorch emits one
+    profiling event per site, and it was only DelegateDoctor's own grouping
+    that used to throw that apart away.
+    """
 
     name: str            # e.g. 'native_call__softmax.out'
     total_ms: float
     call_count: int
     runtime_fraction: float  # share of total inference time, 0.0 - 1.0
+
+    # Per-instruction-site p50s, execution order. Empty when a trace did not
+    # carry them, in which case only the aggregate is available.
+    site_costs: tuple = ()
+
+    # A node identity carried through from lowering, when the trace has one.
+    # ExecuTorch populates debug handles only when the Inspector is given an
+    # ETRecord, so this is normally empty - see `operator_correlation`.
+    debug_node_id: str = ""
 
     @property
     def operator_name(self) -> str:
@@ -70,6 +89,11 @@ class PortableKernel:
         if self.name.startswith(PORTABLE_KERNEL_PREFIX):
             return self.name[len(PORTABLE_KERNEL_PREFIX):]
         return self.name
+
+    @property
+    def site_count(self) -> int:
+        """How many distinct graph sites this operator ran at."""
+        return len(self.site_costs) or self.call_count
 
 
 @dataclass
@@ -210,16 +234,22 @@ def analyze_etdump(etdump_path: str) -> ProfileResult:
     portable_rows = table[table["event_name"].str.startswith(PORTABLE_KERNEL_PREFIX)]
     portable_kernels: List[PortableKernel] = []
     if len(portable_rows) > 0:
+        # One row per instruction site. Grouping produces the aggregate the
+        # report wants, and the per-row costs are kept so repair can target a
+        # single site rather than an operator name.
         grouped = portable_rows.groupby("event_name")[TIME_COLUMN].agg(["sum", "count"])
         for kernel_name, row in grouped.iterrows():
             total_kernel_ms = float(row["sum"])
             fraction = total_kernel_ms / instruction_total if instruction_total else 0.0
+            sites = portable_rows[portable_rows["event_name"] == kernel_name]
             portable_kernels.append(
                 PortableKernel(
                     name=str(kernel_name),
                     total_ms=total_kernel_ms,
                     call_count=int(row["count"]),
                     runtime_fraction=fraction,
+                    site_costs=tuple(float(value) for value in sites[TIME_COLUMN]),
+                    debug_node_id=_debug_node_id(sites),
                 )
             )
 
@@ -235,6 +265,26 @@ def analyze_etdump(etdump_path: str) -> ProfileResult:
         portable_kernels=portable_kernels,
         accounting_warning=accounting_warning,
     )
+
+
+def _debug_node_id(site_rows) -> str:
+    """A stable node identity from the trace, when ExecuTorch supplied one.
+
+    Only meaningful with an ETRecord, which DelegateDoctor does not currently
+    generate. Read defensively so that adding one later starts producing exact
+    identities without another change here, and so a trace that does carry
+    debug handles is never ignored.
+    """
+    for column in ("debug_handles", "debug_handle"):
+        if column not in getattr(site_rows, "columns", ()):
+            continue
+        values = [value for value in site_rows[column] if value not in (None, "")]
+        # Only an unambiguous single handle is an identity. Several handles for
+        # one event means the runtime merged sites, which is exactly the case
+        # this must not guess at.
+        if len(values) == 1 and isinstance(values[0], (int, str)):
+            return str(values[0])
+    return ""
 
 
 def profile_model(

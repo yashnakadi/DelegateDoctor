@@ -39,6 +39,26 @@ def format_header(model_name: str, input_shape: str, target_description: str) ->
     )
 
 
+# What the run's AI exploration amounted to, in one phrase. A provider that
+# never answered proposed nothing, and saying "1 candidate(s), none accepted"
+# about it claimed work that did not happen.
+_AI_SUMMARY_TEXT = {
+    "PROVIDER_ERROR": "provider call failed",
+    "PROVIDER_REFUSED": "provider declined to answer",
+    "PROVIDER_EMPTY_RESPONSE": "provider returned no usable response",
+    "INVALID_STRUCTURED_RESPONSE": "provider response was not usable",
+    "NO_REPAIR_PROPOSED": "completed, no repair proposed",
+}
+
+
+def _ai_exploration_summary(history) -> str:
+    status = history.ai_provider_status
+    if status in _AI_SUMMARY_TEXT:
+        return _AI_SUMMARY_TEXT[status]
+    proposed = history.ai_candidates_proposed
+    return f"completed, {proposed} proposal(s)"
+
+
 def format_summary(outcome) -> str:
     """The whole run in a handful of aligned lines.
 
@@ -102,7 +122,36 @@ def format_summary(outcome) -> str:
         row("Correctness",
             outcome.host_verification.status_text + device_text)
 
-    if outcome.repairs_applied:
+    history = outcome.repair_history
+    if history is not None and history.any_accepted:
+        # Optimization is a sequence now, so the summary counts rather than
+        # naming one repair - and says where each came from, because a run
+        # mixing catalog and AI repairs is an ordinary outcome.
+        row("Accepted repairs", str(history.accepted_count))
+        if history.catalog_count:
+            row("catalog", str(history.catalog_count))
+        if history.ai_count:
+            row("AI", str(history.ai_count))
+            row("Experimental", "Yes")
+            if outcome.ai_provider:
+                row("Provider", f"{outcome.ai_provider} · {outcome.ai_model}")
+        row("Applied", ", ".join(history.applied_repair_ids))
+        if history.rejected_count:
+            row("Rejected", str(history.rejected_count))
+    elif history is not None and history.rejected_count:
+        # A rejected repair is the run's actual finding, so name it and say
+        # which gate ended it. The old text called this a "Repair candidate",
+        # which described what DelegateDoctor was holding rather than what it
+        # had learned - and said it once per duplicate attempt.
+        rejected = [attempt for attempt in history.attempts
+                    if attempt.status == "REJECTED"]
+        row("Repair", ", ".join(sorted({attempt.label for attempt in rejected})))
+        last = rejected[-1]
+        if last.matching_sites:
+            row("Matching sites", str(last.matching_sites))
+        if last.reason:
+            row("Reason", last.reason)
+    elif outcome.repairs_applied:
         row("Repair applied", ", ".join(sorted(outcome.repairs_applied)))
     elif outcome.repair_available:
         row("Repair candidate",
@@ -111,12 +160,44 @@ def format_summary(outcome) -> str:
     elif outcome.status != EXECUTORCH_LOWERING_UNSUPPORTED:
         row("Repair", "not required" if outcome.status in (
             "FULLY_DELEGATED", "NO_REPAIR_REQUIRED") else "none available")
+        history = outcome.repair_history
+        if history is not None and history.ai_provider_status:
+            row("AI exploration", _ai_exploration_summary(history))
+            row("Candidates tested", str(history.ai_candidates_tested))
+        elif history is not None and \
+                history.ai_consent == "not enabled":
+            # Experimental AI repair was not opted into. Saying so on every
+            # default run would make an opt-in feature look like a step that
+            # failed, so nothing is printed at all.
+            pass
+        elif outcome.ai_repair_attempted:
+            row("AI exploration",
+                f"{outcome.ai_candidate_count} candidate(s), none accepted")
+        elif outcome.ai_repair_requested:
+            row("AI exploration", "unavailable")
+
+    if history is not None and history.total_speedup and history.accepted_count > 1:
+        row("Total speedup", f"{history.total_speedup:.2f}x")
 
     lines.append("")
     if outcome.output_pte:
         row("Optimized model", outcome.output_pte)
     row("Report", outcome.report_path or outcome.run_dir)
     return "\n".join(lines)
+
+
+def format_ai_candidate(exploration) -> str:
+    """The one runnable AI candidate, before it faces the ordinary gates."""
+    plan = exploration.plan
+    text = _heading("AI CANDIDATE") + "\n"
+    text += f"{plan.candidate_id}\n"
+    if plan.summary:
+        text += f"{plan.summary}\n"
+    text += (f"{len(plan.operations)} constrained graph operation(s); "
+             f"experimental.\n"
+             f"It now faces the same host, device and benchmark gates a "
+             f"catalog repair does.\n")
+    return text
 
 
 def format_pipeline(stages) -> str:
@@ -377,6 +458,29 @@ def format_verification(verification_result, device_result=None) -> str:
             f"Android: {device_result.status_text} · max abs {device_error}"
             f"{agreement(device_result.argmax_agreement)}\n"
         )
+
+    # Backend fidelity is reported separately, and only when it has something
+    # to say. It describes the backend, not the repair, so it never turns the
+    # Host or Android line above into a FAIL.
+    def fidelity_line(label, result, original, repaired) -> str:
+        status = getattr(result, "backend_fidelity", "") if result else ""
+        if not status or status == "OK":
+            return ""
+        def error(metrics):
+            return f"{metrics.max_absolute_error:.2e}" if metrics else "n/a"
+        line = (f"Backend fidelity ({label}): {status} · original "
+                f"{error(original)} · repaired {error(repaired)}\n")
+        if result.backend_fidelity_reason:
+            line += f"  {result.backend_fidelity_reason}\n"
+        return line
+
+    text += fidelity_line("host vs PyTorch", verification_result,
+                          getattr(verification_result, "original_vs_eager", None),
+                          getattr(verification_result, "repaired_vs_eager", None))
+    if device_result is not None:
+        text += fidelity_line("device vs host", device_result,
+                              device_result.original_device_vs_host,
+                              device_result.repaired_device_vs_host)
 
     host_failed = not verification_result.passed
     device_failed = device_result is not None and not device_result.passed

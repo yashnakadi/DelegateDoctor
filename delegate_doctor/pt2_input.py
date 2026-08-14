@@ -1,6 +1,10 @@
 """Load a `.pt2` exported program and the inputs used to exercise it.
 
-This is DelegateDoctor's entire input boundary:
+NOT a public input path. `.pt2` and `.pt` were once accepted by the CLI; they
+are now internal artifacts, and `model_source` recognises those suffixes only
+in order to refuse them with an explanation. What remains here is the loader
+itself, used to build a `ModelSpec` from a serialized program - in practice by
+the test suite, which needs a program without going through a source file.
 
     model.pt2   a serialized torch.export.ExportedProgram
     inputs.pt   the positional arguments that program is called with

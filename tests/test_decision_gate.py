@@ -182,7 +182,13 @@ def test_delegation_is_not_an_input_to_the_decision():
         "device_verification_passed",
         "before_latency_ms",
         "after_latency_ms",
+        # Backend fidelity: how well the backend reproduces PyTorch. A
+        # correctness question, not a structural one.
+        "backend_fidelity_acceptable",
     ]
+    # The actual invariant, stated directly so it survives future signatures.
+    for parameter in parameters:
+        assert "delegat" not in parameter, parameter
 
 
 # --- reporting behaviour ---------------------------------------------------

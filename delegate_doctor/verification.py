@@ -22,6 +22,24 @@ portable reference softmax versus XNNPACK's vectorised one) with different
 
 The thresholds live at the top of this file, on purpose, so they are easy to
 find and change.
+
+Two questions, not one
+----------------------
+The same distinction the device path draws, drawn here:
+
+    REPAIR SEMANTICS    original ExecuTorch output vs candidate ExecuTorch
+                        output. Did the rewrite change what the model
+                        computes? This is `passed`.
+
+    BACKEND FIDELITY    each program's ExecuTorch output vs PyTorch eager. How
+                        closely does this backend reproduce PyTorch? Measured
+                        for the original as well as the candidate, and
+                        classified by `classify_backend_fidelity`.
+
+The eager comparison used to be folded into `passed`, which meant any model
+whose ExecuTorch build already drifted from PyTorch had every repair rejected
+and reported as a host correctness failure. That is not a fact about the
+rewrite, and the rewrite is not what it should have accused.
 """
 
 from __future__ import annotations
@@ -66,15 +84,25 @@ class ErrorMetrics:
 
 @dataclass
 class VerificationResult:
+    # Repair semantics only: does the candidate still compute what the original
+    # ExecuTorch program computed? Agreement with PyTorch eager is a separate
+    # question - see `backend_fidelity`.
     passed: bool
     repaired_vs_original: ErrorMetrics
     repaired_vs_eager: Optional[ErrorMetrics] = None
+    original_vs_eager: Optional[ErrorMetrics] = None
+    backend_fidelity: str = "OK"
+    backend_fidelity_reason: str = ""
     argmax_agreement: Optional[float] = None
     failure_reasons: list = field(default_factory=list)
 
     @property
     def status_text(self) -> str:
         return "PASS" if self.passed else "FAIL"
+
+    @property
+    def backend_fidelity_acceptable(self) -> bool:
+        return self.backend_fidelity != "FAIL"
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +113,12 @@ class VerificationResult:
             "repaired_vs_eager": (
                 self.repaired_vs_eager.to_dict() if self.repaired_vs_eager else None
             ),
+            "original_vs_eager": (
+                self.original_vs_eager.to_dict() if self.original_vs_eager else None
+            ),
+            "backend_fidelity": self.backend_fidelity,
+            "backend_fidelity_reason": self.backend_fidelity_reason,
+            "backend_fidelity_acceptable": self.backend_fidelity_acceptable,
             "argmax_agreement": self.argmax_agreement,
             "failure_reasons": self.failure_reasons,
         }
@@ -129,9 +163,25 @@ def verify_repair(
     """Decide whether the repaired model still computes the original function.
 
     `original_output` and `repaired_output` are the outputs of the two
-    ExecuTorch programs. `eager_output` is the plain PyTorch result, checked as
-    well when available so a bug in the original export cannot hide.
+    ExecuTorch programs; comparing them is the repair's own gate, and it is
+    what `passed` reports.
+
+    `eager_output` is the plain PyTorch result. Comparing an ExecuTorch program
+    against eager measures the *backend*, not the rewrite: ExecuTorch and
+    XNNPACK use different kernels and different reduction orders from PyTorch,
+    and on a deep network that difference accumulates. Inception V3's untouched
+    original diverges 1.43e-05 from eager before DelegateDoctor changes
+    anything, and its candidate diverges by exactly the same amount - so
+    treating that as a repair failure rejected a repair whose own comparison
+    was 2.62e-06, well inside tolerance.
+
+    So the eager comparison is made for both programs and classified as backend
+    fidelity, with the same policy the device path uses: a discrepancy the
+    candidate introduced, or one dramatically worse than the original's, is
+    still a failure. A pre-existing one is a warning about the backend.
     """
+    from .device_verification import classify_backend_fidelity
+
     failure_reasons = []
 
     repaired_vs_original = compute_error_metrics(repaired_output, original_output)
@@ -143,14 +193,15 @@ def verify_repair(
         )
 
     repaired_vs_eager = None
+    original_vs_eager = None
+    backend_fidelity, backend_fidelity_reason = "OK", ""
     if eager_output is not None:
         repaired_vs_eager = compute_error_metrics(repaired_output, eager_output)
-        if repaired_vs_eager.max_absolute_error > MAX_ABSOLUTE_ERROR_TOLERANCE:
-            failure_reasons.append(
-                f"repaired output differs from PyTorch eager by "
-                f"{repaired_vs_eager.max_absolute_error:.3e}, "
-                f"above the tolerance of {MAX_ABSOLUTE_ERROR_TOLERANCE:g}"
-            )
+        original_vs_eager = compute_error_metrics(original_output, eager_output)
+        backend_fidelity, backend_fidelity_reason = classify_backend_fidelity(
+            original_vs_eager.max_absolute_error,
+            repaired_vs_eager.max_absolute_error,
+        )
 
     argmax_agreement = None
     if argmax_dim is not None:
@@ -167,6 +218,9 @@ def verify_repair(
         passed=len(failure_reasons) == 0,
         repaired_vs_original=repaired_vs_original,
         repaired_vs_eager=repaired_vs_eager,
+        original_vs_eager=original_vs_eager,
+        backend_fidelity=backend_fidelity,
+        backend_fidelity_reason=backend_fidelity_reason,
         argmax_agreement=argmax_agreement,
         failure_reasons=failure_reasons,
     )

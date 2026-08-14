@@ -21,9 +21,35 @@ requires-python = ">=3.12,<3.13"
 # no model zoo of its own.
 dependencies = [
     "executorch==1.4.0",
+
+    # ExecuTorch pulls both of these transitively, but with no floor - and the
+    # pair has a binary interface between them. pandas built against NumPy 1.x
+    # running on NumPy 2.x raises `numpy.core.multiarray failed to import`, and
+    # it raises it inside `executorch.devtools.Inspector`, which is to say
+    # after a model has been exported, lowered, pushed to a device and
+    # profiled. These floors make that combination unresolvable rather than
+    # leaving it for the user to diagnose from the wreckage.
+    #
+    # pandas 2.2.2 is the first release with NumPy 2 support. NumPy 1.26 is the
+    # first with a stable ABI for 3.12. Floors rather than pins: within these
+    # bounds pip picks a mutually-built pair, which is what a clean virtual
+    # environment does anyway.
+    "numpy>=1.26",
+    "pandas>=2.2.2",
 ]
 
 [project.optional-dependencies]
+ai = [
+    "litellm==1.96.2",
+]
+# Optional bring-your-own-key AI assistance. LiteLLM is the provider transport
+# only - DelegateDoctor ships no key, owns no account and funds no inference.
+# Pinned rather than ranged: LiteLLM moves quickly, and this is the version the
+# provider adapter was written and tested against.
+# There is no credential dependency: DelegateDoctor does not store API keys.
+# The user supplies one through the environment when they want AI.
+
+
 # The demonstration scripts in examples/ build real models, so they need real
 # model libraries. The core package imports none of these - a regression test
 # asserts that - which is why they are an extra rather than a dependency.
@@ -31,10 +57,14 @@ examples = [
     "torchvision==0.28.0",
     "segmentation_models_pytorch==0.5.0",
 ]
-# The test suite only. DelegateDoctor itself has no optional backends: no AI,
-# no remote services, no credentials.
+# The test suite only.
 dev = [
     "pytest>=8.0",
+]
+
+# Everything a user of the full experience needs, in one name.
+all = [
+    "delegate-doctor[ai,examples]",
 ]
 
 [project.scripts]

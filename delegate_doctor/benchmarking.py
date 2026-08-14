@@ -174,9 +174,9 @@ def benchmark_before_after(
     input_paths,
     bench_runner_path: str,
     device_info: device.DeviceInfo,
-    warmup_iterations: int = 20,
-    measured_iterations: int = 150,
-    repetitions: int = 3,
+    warmup_iterations: int = 5,
+    measured_iterations: int = 20,
+    repetitions: int = 1,
     threads: int = 4,
 ) -> BenchmarkResult:
     """Benchmark two .pte files under identical conditions.

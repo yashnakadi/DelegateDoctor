@@ -109,10 +109,20 @@ def test_a_spec_carries_an_exported_program_not_a_module(tmp_path):
 
 # --- CLI surface ------------------------------------------------------------
 
-def test_optimize_requires_an_inputs_file():
-    with pytest.raises(SystemExit) as caught:
-        cli.main(["optimize", "model.pt2"])
-    assert caught.value.code != 0
+def test_an_exported_program_is_no_longer_a_public_entry_point(tmp_path, capsys):
+    """.pt2 is an internal artifact now: the CLI names the replacement."""
+    model = tmp_path / "model.pt2"
+    model.write_bytes(b"\x00")
+    assert cli.main(["optimize", str(model)]) == 2
+    error = capsys.readouterr().err
+    assert "serialized artifact" in error
+    assert "from delegate_doctor import optimize" in error
+
+
+def test_the_inputs_flag_is_gone_from_the_parser():
+    """--inputs existed only to feed a .pt2. Nothing else ever used it."""
+    with pytest.raises(SystemExit):
+        cli.main(["optimize", "model.py", "--inputs", "inputs.pt"])
 
 
 @pytest.mark.parametrize("target", [
@@ -121,13 +131,12 @@ def test_optimize_requires_an_inputs_file():
     "https://huggingface.co/owner/model",
 ])
 def test_urls_are_rejected_by_the_cli(target, capsys):
-    assert cli.main(["optimize", target, "--inputs", "inputs.pt"]) == 2
+    assert cli.main(["optimize", target]) == 2
     assert "unsupported model input" in capsys.readouterr().err
 
 
 def test_a_missing_model_file_exits_two(tmp_path, capsys):
-    assert cli.main(["optimize", str(tmp_path / "nope.pt2"),
-                     "--inputs", str(tmp_path / "nope.pt")]) == 2
+    assert cli.main(["optimize", str(tmp_path / "nope.py")]) == 2
     assert "not found" in capsys.readouterr().err
 
 
@@ -138,13 +147,12 @@ def test_setup_agent_no_longer_exists():
 
 def test_refresh_flag_no_longer_exists():
     with pytest.raises(SystemExit):
-        cli.main(["optimize", "model.pt2", "--inputs", "inputs.pt", "--refresh"])
+        cli.main(["optimize", "model.py", "--refresh"])
 
 
 def test_model_selection_flag_no_longer_exists():
     with pytest.raises(SystemExit):
-        cli.main(["optimize", "model.pt2", "--inputs", "inputs.pt",
-                  "--model", "resnet20"])
+        cli.main(["optimize", "model.py", "--model", "resnet20"])
 
 
 def test_the_remaining_subcommands_are_the_intended_two(capsys):
@@ -156,23 +164,40 @@ def test_the_remaining_subcommands_are_the_intended_two(capsys):
     assert "doctor MODEL" not in text
 
 
-def test_help_advertises_the_pt2_workflow(capsys):
+def test_help_advertises_the_two_workflows(capsys):
+    """model.py on the CLI, and the API for the no-AI route."""
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     text = capsys.readouterr().out
-    assert "model.pt2" in text and "--inputs" in text
-    for gone in ("github", "GitHub", "Ollama", "repository URL"):
+    assert "optimize model.py" in text
+    assert "from delegate_doctor import optimize" in text
+    for gone in ("model.pt2", "--inputs", "github", "GitHub", "Ollama",
+                 "repository URL"):
         assert gone not in text
 
 
 # --- nothing of the removed subsystems remains ------------------------------
 
+# The removed subsystems: a bundled local LLM server, and repository ingestion.
+# Neither may come back in any form.
+# The removed subsystems: a *bundled* local LLM server that DelegateDoctor ran
+# itself, and repository ingestion. Neither may come back.
+#
+# LiteLLM is deliberately absent from this list: it is now the provider
+# transport for bring-your-own-key AI. The thing that was removed was
+# DelegateDoctor operating an inference service, not the ability to call the
+# user's own provider.
 REMOVED_TOKENS = (
-    "ollama", "Ollama", "qwen", "setup-agent", "MAX_INGESTION_ATTEMPTS",
-    "need_user_input", "adapter_code", "127.0.0.1:11434", "litellm", "LiteLLM",
-    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "hubconf", "commit_sha",
-    "OWNER__REPO", "github_source", "ingest_github", "create_model()",
+    "setup-agent", "MAX_INGESTION_ATTEMPTS", "need_user_input",
+    "127.0.0.1:11434", "hubconf", "commit_sha", "OWNER__REPO",
+    "github_source", "ingest_github",
 )
+
+# Provider key names appear in exactly one place, and only so that they can be
+# stripped out of child environments and redacted from text. Anywhere else they
+# would mean DelegateDoctor was *reading* a provider credential directly.
+KEY_NAMES_ALLOWED_ONLY_IN_THE_AGENT = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                                       "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN")
 
 
 def test_no_ai_or_repository_ingestion_remains_in_the_package():
@@ -180,6 +205,26 @@ def test_no_ai_or_repository_ingestion_remains_in_the_package():
         text = path.read_text()
         for token in REMOVED_TOKENS:
             assert token not in text, f"{path.name} still references {token}"
+
+
+def test_provider_key_names_appear_only_where_they_are_stripped():
+    for path in (PROJECT_ROOT / "delegate_doctor").rglob("*.py"):
+        if path.parent.name == "agent":
+            continue
+        text = path.read_text()
+        for token in KEY_NAMES_ALLOWED_ONLY_IN_THE_AGENT:
+            assert token not in text, (
+                f"{path.name} references {token} outside the agent package")
+
+
+def test_the_agent_only_names_provider_keys_to_remove_them():
+    """privacy.py lists them; nothing there ever reads one."""
+    source = (PROJECT_ROOT / "delegate_doctor" / "agent" / "privacy.py").read_text()
+    assert "OPENAI_API_KEY" in source              # it is on the removal list
+    for reading in ('os.environ["OPENAI_API_KEY"]',
+                    'os.environ.get("OPENAI_API_KEY")',
+                    'getenv("OPENAI_API_KEY")'):
+        assert reading not in source, f"privacy.py reads a provider key: {reading}"
 
 
 def test_the_removed_modules_are_gone():
@@ -193,16 +238,54 @@ def test_no_module_imports_the_removed_subsystems():
     for path in (PROJECT_ROOT / "delegate_doctor").rglob("*.py"):
         text = path.read_text()
         for token in ("import ollama", "from .ingestion", "import custom_model",
-                      "from .custom_model", "import redaction", "urllib.request"):
+                      "from .custom_model", "import redaction"):
             assert token not in text, f"{path.name} imports {token}"
 
 
-def test_the_readme_documents_the_pt2_workflow():
+def test_only_the_ai_client_may_reach_the_network():
+    """Two deliberate egress points, so those are the only things to audit.
+
+    `client.py` talks to the AI provider the user configured. That is the only
+    one: DelegateDoctor no longer downloads an Android SDK, because Android
+    Studio installs it. A second name appearing here should be a conversation,
+    not a merge.
+    """
+    allowed = {"client.py"}
+    for path in (PROJECT_ROOT / "delegate_doctor").rglob("*.py"):
+        if path.name in allowed:
+            continue
+        text = path.read_text()
+        for token in ("urllib.request", "http.client", "import requests",
+                      "socket.socket"):
+            assert token not in text, f"{path.name} can reach the network"
+
+
+
+
+def test_the_readme_documents_the_two_workflows():
     text = (PROJECT_ROOT / "README.md").read_text()
-    assert "torch.export.save" in text
-    assert "optimize model.pt2 --inputs inputs.pt" in text
-    for gone in ("Ollama", "qwen", "setup-agent", "hubconf", "--refresh"):
+    assert "delegate-doctor optimize model.py" in text
+    assert "from delegate_doctor import optimize" in text
+    # The artifact entry point is gone from the CLI, so the README must not
+    # still teach a command that now fails. Describing the removal is fine;
+    # printing it as a runnable command is not.
+    assert "delegate-doctor optimize model.pt2" not in text
+    assert "--inputs inputs.pt" not in text.replace(
+        "used to accept `model.pt2 --inputs inputs.pt`", "")
+    # The removed subsystem was DelegateDoctor *operating* a bundled local LLM
+    # server. Ollama as a provider the user chooses and runs themselves is a
+    # different thing, and is documented deliberately.
+    for gone in ("setup-agent", "hubconf", "--refresh"):
         assert gone not in text, f"README still mentions {gone}"
+
+
+def test_the_readme_states_the_byok_boundary():
+    text = (PROJECT_ROOT / "README.md").read_text()
+    assert "Bring your own key" in text
+    assert "ships no key" in text
+    assert "delegate-doctor configure-ai" in text
+    # The two AI permissions must be described as separate.
+    assert "agreeing to one is not agreeing to the other" in text
 
 
 # --- repository hygiene (kept from the previous suite) ----------------------

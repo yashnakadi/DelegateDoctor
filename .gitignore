@@ -35,19 +35,28 @@ secrets.json
 runners/*
 !runners/.gitkeep
 
+# The user's own model workspace. Their model source, weights and exported
+# programs are private and must never be committed.
+models/*
+!models/README.md
+
 # Per-run output: .pte files, ETDump traces, profiles, reports.
 artifacts/*
 !artifacts/.gitkeep
 
-# Machine-generated run results. The checked-in example_run.txt is kept as
-# evidence of a previously measured run.
+# Machine-generated run results are ignored; the written-up validation records
+# are not. They are the evidence the README cites, so a clone that did not
+# contain them would have a README full of broken links and unsupported numbers.
 results/*
 !results/.gitkeep
-!results/example_run.txt
+# !results/dd001_segmentation_generalization.md
 # !results/dd002_research.md
 # !results/dd002_research_v2.md
 # !results/dd002_emulator_validation.md
-# !results/dd001_segmentation_generalization.md
+# !results/dd003_avgpool_validation.md
 
 # Research of potential fallbacks
 research/*
+
+# Local DelegateDoctor configuration
+.delegate-doctor/

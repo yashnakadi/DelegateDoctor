@@ -29,6 +29,7 @@ from dataclasses import dataclass
 ACCEPTED = "accepted"
 REJECTED_VERIFICATION = "rejected_host_verification_failed"
 REJECTED_DEVICE_VERIFICATION = "rejected_device_verification_failed"
+REJECTED_BACKEND_FIDELITY = "rejected_backend_fidelity_regression"
 REJECTED_PERFORMANCE = "rejected_no_performance_improvement"
 
 # A recommendation, not a correctness threshold. Any measurable improvement is
@@ -70,6 +71,8 @@ class RepairDecision:
             return "REPAIR REJECTED - host numerical verification failed"
         if self.outcome == REJECTED_DEVICE_VERIFICATION:
             return "REPAIR REJECTED - Android numerical verification failed"
+        if self.outcome == REJECTED_BACKEND_FIDELITY:
+            return "REPAIR REJECTED - the repair made backend fidelity worse"
         return "REPAIR REJECTED - no performance improvement"
 
     def to_dict(self) -> dict:
@@ -88,6 +91,7 @@ def decide_repair(
     device_verification_passed: bool,
     before_latency_ms: float,
     after_latency_ms: float,
+    backend_fidelity_acceptable: bool = True,
 ) -> RepairDecision:
     """Accept the repair only if it is correct on both host and device, and faster.
 
@@ -99,6 +103,11 @@ def decide_repair(
       * `device_verification_passed` - the tensors the Android device actually
         produced. Catches a backend-specific miscompilation that the host cannot
         see, which is a failure mode we have observed for real.
+
+    `backend_fidelity_acceptable` is a third, different question: how well the
+    backend reproduces PyTorch. It is False only when the *candidate* made that
+    worse - never merely because the untouched original already drifted. See
+    `device_verification.classify_backend_fidelity`.
 
     Latencies are p50 (median) on the Arm target, measured with the tracer-free
     runner so profiling instrumentation cannot influence the comparison.
@@ -135,6 +144,20 @@ def decide_repair(
                 "signature of a backend-specific problem, and it is exactly the "
                 "case a host-only check would have missed, so the repair was "
                 "discarded."
+            ),
+        )
+
+    if not backend_fidelity_acceptable:
+        return RepairDecision(
+            outcome=REJECTED_BACKEND_FIDELITY,
+            speedup=speedup,
+            before_latency_ms=before_latency_ms,
+            after_latency_ms=after_latency_ms,
+            message=(
+                "The repaired model reproduces the original's device output, "
+                "but it reproduces the *host* result materially less well than "
+                "the original did. The rewrite made the backend's agreement "
+                "with PyTorch worse, so the repair was discarded."
             ),
         )
 

@@ -51,7 +51,7 @@ def run(spec, tmp_path, **options):
 @pytest.fixture
 def no_device(monkeypatch):
     monkeypatch.setattr(pipeline, "_find_device",
-                        lambda runners_dir: (None, None, None,
+                        lambda runners_dir, **options: (None, None, None,
                                              "No Arm64 Android target is attached."))
 
 
@@ -170,7 +170,7 @@ def fake_profile(portable_ms=8.2, kernels=("native_call_fmod.out",)):
 def fake_target(monkeypatch):
     """A device that exists and profiles, so the no-repair branch is reachable."""
     monkeypatch.setattr(pipeline, "_find_device",
-                        lambda runners_dir: (FakeDevice(), "bench", "etdump", ""))
+                        lambda runners_dir, **options: (FakeDevice(), "bench", "etdump", ""))
     monkeypatch.setattr(pipeline.profiling, "profile_model",
                         lambda **kwargs: fake_profile())
 
@@ -192,7 +192,7 @@ def test_a_model_with_no_matching_rule_is_still_analyzed(tmp_path, fake_target):
 
 def test_no_portable_hotspot_means_no_repair_required(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "_find_device",
-                        lambda runners_dir: (FakeDevice(), "bench", "etdump", ""))
+                        lambda runners_dir, **options: (FakeDevice(), "bench", "etdump", ""))
     monkeypatch.setattr(pipeline.profiling, "profile_model",
                         lambda **kwargs: fake_profile(portable_ms=0.0, kernels=()))
 
@@ -222,7 +222,7 @@ def test_an_unverifiable_output_blocks_acceptance(tmp_path, fake_target):
 def test_an_int64_input_is_a_transport_limit_not_a_rejection(tmp_path, monkeypatch):
     """A device is attached, but the runner cannot carry this dtype."""
     monkeypatch.setattr(pipeline, "_find_device",
-                        lambda runners_dir: (FakeDevice(), "bench", "etdump", ""))
+                        lambda runners_dir, **options: (FakeDevice(), "bench", "etdump", ""))
 
     class IntNet(torch.nn.Module):
         def forward(self, ids):

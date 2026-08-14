@@ -54,6 +54,10 @@ FULLY_DELEGATED = "FULLY_DELEGATED"
 NO_REPAIR_REQUIRED = "NO_REPAIR_REQUIRED"
 NO_REPAIR_AVAILABLE = "NO_REPAIR_AVAILABLE"
 REPAIR_ACCEPTED = "REPAIR_ACCEPTED"
+# One coherent addition rather than an enum entry per combination: the only
+# thing the singular status cannot express is that a *sequence* of repairs was
+# accepted, which is a different shape of answer, not a different degree.
+REPAIRS_ACCEPTED = "REPAIRS_ACCEPTED"
 REPAIR_REJECTED = "REPAIR_REJECTED"
 EXECUTORCH_LOWERING_UNSUPPORTED = "EXECUTORCH_LOWERING_UNSUPPORTED"
 DEVICE_EXECUTION_UNSUPPORTED = "DEVICE_EXECUTION_UNSUPPORTED"
@@ -63,8 +67,11 @@ OUTCOME_TEXT = {
     ANALYSIS_COMPLETE: "Analysis complete.",
     FULLY_DELEGATED: "Fully delegated to XNNPACK. No repair required.",
     NO_REPAIR_REQUIRED: "No portable hotspot found. No repair required.",
-    NO_REPAIR_AVAILABLE: "No repair in the catalog matches this model.",
+    NO_REPAIR_AVAILABLE: "No known DelegateDoctor repair matches this model.",
     REPAIR_ACCEPTED: "Repair verified and faster on the target. Accepted.",
+    REPAIRS_ACCEPTED: (
+        "Several repairs verified and faster on the target. Accepted."
+    ),
     REPAIR_REJECTED: "Repair rejected: it did not pass every gate.",
     EXECUTORCH_LOWERING_UNSUPPORTED: (
         "The graph exported, but ExecuTorch could not lower it."
@@ -126,11 +133,36 @@ class OptimizationResult:
     detections: dict = field(default_factory=dict)   # rule id -> DetectionResult
     repairs_applied: dict = field(default_factory=dict)  # rule id -> site count
 
+    # The full optimization sequence: every hotspot considered, in order, and
+    # what became of it. This is the authoritative account of a run - the
+    # singular fields below describe only the last accepted repair, and would
+    # misrepresent a run that accepted three.
+    repair_history: object = None
+
     # gates
     host_verification: object = None
     device_verification: object = None
     benchmark: object = None
     decision: object = None
+
+    # Where the repair came from. "catalog" for DD-001/DD-002, "ai" for an
+    # experimental candidate, None when nothing was applied. An AI candidate is
+    # accepted for *this run* only - it is never promoted to a catalog rule.
+    _repair_source: Optional[str] = None
+    _repair_id: Optional[str] = None
+
+    # What a repair could be worth, worked out once (`repair_opportunity`) and
+    # rendered identically by the terminal, report.txt and report.html. None
+    # when the run never reached a profile, because there is nothing to weigh.
+    opportunity: object = None
+
+    # Non-secret provider metadata, for the report. Never a credential.
+    ai_provider: Optional[str] = None
+    ai_model: Optional[str] = None
+    ai_repair_requested: bool = False
+    ai_repair_attempted: bool = False
+    ai_candidate_count: int = 0
+    ai_attempt_summaries: list = field(default_factory=list)
 
     # the Arm target that produced any measurement here, if one did
     device_description: str = ""
@@ -155,7 +187,59 @@ class OptimizationResult:
 
     @property
     def repair_accepted(self) -> bool:
-        return self.status == REPAIR_ACCEPTED
+        return self.status in (REPAIR_ACCEPTED, REPAIRS_ACCEPTED)
+
+    @property
+    def accepted_repairs(self) -> list:
+        """Every repair that passed its gates, in the order applied."""
+        if self.repair_history is None:
+            return []
+        return list(self.repair_history.accepted)
+
+    @property
+    def accepted_repair_count(self) -> int:
+        return len(self.accepted_repairs)
+
+    @property
+    def repair_experimental(self) -> bool:
+        """Did any accepted repair come from AI rather than the catalog?
+
+        Derived rather than stored: with several repairs in a run, a flag set
+        once could easily outlive the repair that justified it, or be missed by
+        the one that should have set it.
+        """
+        return any(attempt.source == "ai" for attempt in self.accepted_repairs)
+
+    @property
+    def repair_source(self) -> Optional[str]:
+        """Where the last accepted repair came from.
+
+        Kept for callers written before repairs could accumulate. It reports
+        the *last* accepted repair, and `"mixed"` when a run accepted both
+        catalog and AI repairs - which is the honest answer to a question that
+        assumes there was only one.
+        """
+        accepted = self.accepted_repairs
+        if not accepted:
+            return self._repair_source
+        sources = {attempt.source for attempt in accepted}
+        if len(sources) > 1:
+            return "mixed"
+        return accepted[-1].source
+
+    @repair_source.setter
+    def repair_source(self, value):
+        self._repair_source = value
+
+    @property
+    def repair_id(self) -> Optional[str]:
+        """The last accepted repair's id. See `repair_source` on the caveat."""
+        accepted = self.accepted_repairs
+        return accepted[-1].label if accepted else self._repair_id
+
+    @repair_id.setter
+    def repair_id(self, value):
+        self._repair_id = value
 
     @property
     def analyzed(self) -> bool:
@@ -225,6 +309,20 @@ class OptimizationResult:
             "stages": [stage.to_dict() for stage in self.stages],
             "repair_available": self.repair_available,
             "repairs_applied": dict(self.repairs_applied),
+            "repair_source": self.repair_source,
+            "repair_id": self.repair_id,
+            "repair_experimental": self.repair_experimental,
+            "accepted_repairs": self.accepted_repair_count,
+            "repair_history": (self.repair_history.to_dict()
+                               if self.repair_history is not None else None),
+            "repair_opportunity": (self.opportunity.to_dict()
+                                   if self.opportunity is not None else None),
+            "ai_provider": self.ai_provider,
+            "ai_model": self.ai_model,
+            "ai_repair_requested": self.ai_repair_requested,
+            "ai_repair_attempted": self.ai_repair_attempted,
+            "ai_candidate_count": self.ai_candidate_count,
+            "ai_attempt_summaries": list(self.ai_attempt_summaries),
             "device": self.device_description,
             "device_is_emulator": self.device_is_emulator,
             "run_dir": self.run_dir,

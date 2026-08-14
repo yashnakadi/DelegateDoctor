@@ -673,6 +673,225 @@ def _hotspots(outcome, limit: int = 3) -> str:
             + "".join(rows) + more + '</div></section>')
 
 
+def _repair_opportunity(outcome) -> str:
+    """What a repair could be worth, from the same object the terminal used.
+
+    Nothing here is recomputed: every number comes from the summary the
+    pipeline built once, so the report cannot quietly disagree with the screen
+    the user answered a question on.
+    """
+    summary = getattr(outcome, "opportunity", None)
+    if summary is None or not summary.has_measurement:
+        return ""
+
+    rows = []
+    if summary.measured_latency_ms is not None:
+        rows.append(_row("Method::execute",
+                         f"{summary.measured_latency_ms:.3f} ms"))
+    if summary.operator_delegation is not None:
+        rows.append(_row("Operator delegation",
+                         _percent(summary.operator_delegation)))
+    rows.append(_row("Runtime delegation", _percent(summary.runtime_delegation)))
+    rows.append(_row("Portable runtime",
+                     _percent(summary.portable_runtime_fraction)))
+    if summary.portable_runtime_ms is not None:
+        rows.append(_row("Portable event time",
+                         f"{summary.portable_runtime_ms:.3f} ms"))
+    rows.append(_row("Catalog repair", esc(summary.catalog_match)))
+    rows.append(_row("AI exploration", esc(summary.ai_status)))
+
+    hotspot = summary.top_hotspot
+    lead = ""
+    if hotspot is not None:
+        lead = (
+            f'<div class="metric-value small">{esc(hotspot.operator)}</div>'
+            f'<div class="note">{hotspot.runtime_ms:.3f} ms &middot; '
+            f'{_percent(hotspot.total_fraction)} of measured runtime &middot; '
+            f'{_percent(hotspot.portable_fraction)} of all fallback</div>'
+            f'{_bar(hotspot.total_fraction, "warn")}'
+        )
+
+    ceiling = summary.theoretical_upper_bound_speedup
+    bound = ""
+    if ceiling is not None:
+        # A number in a labelled row, like every other measurement here. The
+        # word "theoretical" carries the caveat; a paragraph repeating it on
+        # every run does not earn its space.
+        rows.insert(0, _row("Theoretical upper bound", f"{ceiling:.2f}x"))
+
+    others = ""
+    if summary.other_hotspots:
+        items = "".join(
+            f'<div class="more">{esc(other.operator)} &middot; '
+            f'{other.runtime_ms:.3f} ms &middot; '
+            f'{_percent(other.total_fraction)}</div>'
+            for other in summary.other_hotspots)
+        others = f'<div class="note">Other portable operators</div>{items}'
+
+    return ('<section><h2>Repair opportunity</h2><div class="card">'
+            + lead + bound
+            + f'<table class="rows">{"".join(rows)}</table>'
+            + others + '</div></section>')
+
+
+def _share_line(attempt) -> str:
+    """The measured share a catalog attempt targeted, when there was one.
+
+    A model-level AI candidate has no single share: it is a proposal about the
+    graph, and putting an operator percentage on it would imply a targeting
+    decision DelegateDoctor did not make.
+    """
+    if attempt.hotspot is None:
+        return f'<div class="note">{esc(attempt.source)}</div>'
+    tone = {"ACCEPTED": "ok", "REJECTED": "warn"}.get(attempt.status, "idle")
+    # A catalog rule is applied to every site it matches, so the share it
+    # represents is the sites' total - not the one site that happened to rank
+    # highest. Falling back keeps AI rows, which have no site set, unchanged.
+    share = (attempt.represented_runtime if attempt.represented_runtime is not None
+             else attempt.hotspot.runtime_share)
+    sites = ""
+    if attempt.matching_sites:
+        sites = (f' &middot; {attempt.matching_sites} matching site'
+                 f'{"" if attempt.matching_sites == 1 else "s"}')
+    return (f'<div class="note">runtime share before &middot; '
+            f'{_percent(share)}{sites} &middot; '
+            f'{esc(attempt.source)}</div>'
+            f'{_bar(share, tone)}')
+
+
+def _journey(outcome) -> str:
+    """The optimization sequence, made visually obvious.
+
+    A single before/after table would hide the thing that matters most about
+    this run: that it was iterative, that each step was measured against the
+    one before it, and that some steps were rejected. So each attempt gets its
+    own row, in order, including the ones that did not survive.
+    """
+    history = getattr(outcome, "repair_history", None)
+    if history is None or not history.attempts:
+        return ""
+
+    def endpoint(title, operator_delegation, runtime_delegation, latency):
+        rows = []
+        if operator_delegation is not None:
+            rows.append(_row("Operator delegation", _percent(operator_delegation)))
+        if runtime_delegation is not None:
+            rows.append(_row("Runtime delegation", _percent(runtime_delegation)))
+        if latency is not None:
+            rows.append(_row("p50", _ms(latency)))
+        if not rows:
+            return ""
+        return (f'<div class="card"><div class="note">{esc(title)}</div>'
+                f'<table class="rows">{"".join(rows)}</table></div>')
+
+    steps = []
+    for position, attempt in enumerate(history.attempts, start=1):
+        tone = {"ACCEPTED": "ok", "REJECTED": "warn"}.get(attempt.status, "idle")
+        latency = ""
+        if attempt.before_latency_ms and attempt.after_latency_ms:
+            latency = (f'<div class="note">p50 '
+                       f'{_ms(attempt.before_latency_ms)} &rarr; '
+                       f'{_ms(attempt.after_latency_ms)}'
+                       + (f' &middot; {attempt.speedup:.2f}x'
+                          if attempt.speedup else "")
+                       + '</div>')
+        gates = []
+        if attempt.host_verification_passed is not None:
+            gates.append("host " + ("PASS" if attempt.host_verification_passed
+                                    else "FAIL"))
+        if attempt.device_verification_passed is not None:
+            gates.append("device " + ("PASS" if attempt.device_verification_passed
+                                      else "FAIL"))
+        # Named separately from the two correctness gates, because it is a
+        # statement about the backend rather than about this repair.
+        if attempt.backend_fidelity and attempt.backend_fidelity != "OK":
+            gates.append(f"backend fidelity {attempt.backend_fidelity}")
+        gate_line = (f'<div class="note">{" &middot; ".join(esc(gate) for gate in gates)}</div>'
+                     if gates else "")
+        reason = (f'<div class="note">{esc(attempt.reason)}</div>'
+                  if attempt.reason else "")
+
+        runtimes = ""
+
+        steps.append(
+            f'<div class="hotspot">'
+            f'<div class="hotspot-head">'
+            f'<span class="hotspot-name">{position}. '
+            f'{esc(attempt.subject)}</span>'
+            f'<span class="hotspot-cost">{esc(attempt.label)} '
+            f'<span class="tag {tone}">{esc(attempt.status)}</span></span>'
+            f'</div>'
+            f'{_share_line(attempt)}'
+            f'{runtimes}{gate_line}{latency}{reason}'
+            f'</div>'
+        )
+
+    totals = ""
+    if history.total_speedup:
+        totals = (f'<div class="card"><div class="metric-value">'
+                  f'{history.total_speedup:.2f}x</div>'
+                  f'<div class="note">original to final, measured end to end on '
+                  f'the same target</div></div>')
+
+    stop = (f'<div class="note">Stopped because {esc(history.stop_reason)}</div>'
+            if history.stop_reason else "")
+
+    policy = _journey_policy(history)
+
+    return (
+        '<section><h2>Optimization journey</h2>'
+        + policy
+        + endpoint("Original", history.original_operator_delegation,
+                   history.original_runtime_delegation,
+                   history.original_latency_ms)
+        + f'<div class="card">{"".join(steps)}{stop}</div>'
+        + endpoint("Final", history.final_operator_delegation,
+                   history.final_runtime_delegation,
+                   history.final_latency_ms)
+        + totals
+        + '</section>'
+    )
+
+
+# What the two thresholds and the single consent decision mean, said once at
+# the top of the journey rather than repeated against every step.
+_AI_CONSENT_TEXT = {
+    "granted": ("approved once for this run, covering every remaining "
+                "hotspot"),
+    "declined": "declined, so no AI repair was attempted",
+    "unavailable": "no AI provider was configured, so none was attempted",
+    "not needed": "not required: no eligible unknown hotspot came up",
+}
+
+
+def _journey_policy(history) -> str:
+    """How this run chose what to repair, in the order it actually applied."""
+    from . import model_exploration, repair_loop
+
+    consent = _AI_CONSENT_TEXT.get(history.ai_consent, esc(history.ai_consent))
+    offered = ""
+    if history.ai_hotspots_offered:
+        offered = (f' &middot; {history.ai_hotspots_offered} hotspot(s) '
+                   f'presented')
+
+    rows = [
+        _row("Known repairs",
+             f"applied automatically above "
+             f"{100 * repair_loop.MIN_DD_HOTSPOT_RUNTIME_SHARE:.1f}% of runtime"),
+        _row("AI repairs",
+             f"one bounded investigation of the whole model, offered when "
+             f"portable runtime exceeds "
+             f"{100 * model_exploration.MIN_AI_PORTABLE_RUNTIME_SHARE:.0f}%",
+             wide=True),
+        _row("AI consent", esc(consent) + offered, wide=True),
+    ]
+    return ('<div class="card"><table class="rows">'
+            + "".join(rows)
+            + '</table><div class="note">A known repair is tried before any AI '
+              'proposal, at every re-profile. A hotspot the catalog recognises '
+              'is never sent to a provider.</div></div>')
+
+
 def _kernel_matches(outcome, rule_id: str, kernel_name: str) -> bool:
     """Ask the catalog, without importing rule internals into the report."""
     matcher = outcome.repair_catalog.get(rule_id, {}).get("matches")
@@ -966,6 +1185,8 @@ def render(outcome, executorch_version: str = "") -> str:
         _hero(outcome),
         _delegation(outcome),
         _hotspots(outcome),
+        _repair_opportunity(outcome),
+        _journey(outcome),
         _repair(outcome),
         _correctness(outcome),
         _benchmark(outcome),

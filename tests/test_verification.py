@@ -124,3 +124,68 @@ def test_argmax_agreement_is_a_fraction():
     b = torch.tensor([[[[0.0]], [[1.0]]]])   # argmax along dim 1 -> 1
     assert compute_argmax_agreement(a, a, dim=1) == 1.0
     assert compute_argmax_agreement(a, b, dim=1) == 0.0
+
+
+# --- backend fidelity is not a repair failure ---------------------------------
+
+def test_a_backend_that_already_drifts_from_eager_is_not_the_repairs_fault():
+    """The measured Inception V3 case.
+
+    ExecuTorch's own output sits 1.43e-05 from PyTorch eager *before* any
+    repair, and the candidate sits exactly the same distance away. The repair's
+    own comparison is 2.62e-06, well inside tolerance. Folding the eager
+    comparison into `passed` rejected that repair and called it a host
+    correctness failure.
+    """
+    torch.manual_seed(0)
+    eager = torch.randn(1, 1000)
+    # Both ExecuTorch programs drift from eager by the same amount, and agree
+    # with each other closely.
+    original = eager + 1.43e-05
+    repaired = original + 2.62e-06
+
+    result = verify_repair(original_output=original, repaired_output=repaired,
+                           eager_output=eager, argmax_dim=1)
+
+    assert result.passed, "the repair reproduces the original ExecuTorch output"
+    assert result.failure_reasons == []
+    assert result.backend_fidelity == "WARNING"
+    assert result.backend_fidelity_acceptable
+    assert result.original_vs_eager is not None
+
+
+def test_a_candidate_that_walks_away_from_eager_alone_fails():
+    """The original agrees with eager; the candidate does not."""
+    torch.manual_seed(0)
+    eager = torch.randn(1, 1000)
+    original = eager.clone()
+    repaired = eager + 0.4
+
+    result = verify_repair(original_output=original, repaired_output=repaired,
+                           eager_output=eager, argmax_dim=1)
+
+    # Repair semantics catch it first, and backend fidelity blames it correctly.
+    assert not result.passed
+    assert result.backend_fidelity == "FAIL"
+    assert not result.backend_fidelity_acceptable
+
+
+def test_repair_semantics_still_fail_on_a_genuinely_wrong_rewrite():
+    """Nothing about backend fidelity softens the repair's own gate."""
+    torch.manual_seed(0)
+    original = torch.randn(1, 1000)
+    repaired = original + 0.5
+
+    result = verify_repair(original_output=original, repaired_output=repaired,
+                           eager_output=None, argmax_dim=1)
+
+    assert not result.passed
+    assert any("differs from the original" in reason
+               for reason in result.failure_reasons)
+
+
+def test_the_host_tolerance_is_unchanged():
+    from delegate_doctor import verification
+
+    assert verification.MAX_ABSOLUTE_ERROR_TOLERANCE == 1e-5
+    assert verification.REQUIRED_ARGMAX_AGREEMENT == 1.0

@@ -299,9 +299,14 @@ def test_the_known_log_records_are_dropped(caplog):
     console_noise.restore_import_logging()
     console_noise.quieten_import_logging()
     try:
-        for logger_name, _, _ in console_noise.KNOWN_LOG_RECORDS:
-            logging.getLogger(logger_name).warning(REDIRECTS)
-            logging.getLogger(logger_name).warning(KERNEL_PREFERENCE)
+        # Each message on *its own* logger. A filter is a (logger, needle)
+        # pair, so emitting every message on every logger would leave one
+        # legitimately unfiltered - and a version of this test that did that
+        # passed only by accident of logger propagation.
+        for logger_name, needle, _ in console_noise.KNOWN_LOG_RECORDS:
+            message = (REDIRECTS if needle in REDIRECTS else KERNEL_PREFERENCE)
+            assert needle in message, f"no sample message matches {needle!r}"
+            logging.getLogger(logger_name).warning(message)
         assert "Redirects are currently not supported" not in caplog.text
         assert "register_constant() on Enum subclasses" not in caplog.text
     finally:

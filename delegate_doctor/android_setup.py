@@ -13,7 +13,7 @@ That binary - ExecuTorch's own `executor_runner` - has to be cross-compiled, and
 cross-compiling it needs the ExecuTorch C++ source tree.
 
 The source is build-time only. Once the two runners are in `runners/`, normal
-`delegate-doctor doctor` runs never touch `.build/` again.
+`delegate-doctor optimize` runs never touch `.build/` again.
 
 Why two runners
 ---------------
@@ -42,7 +42,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import device
+from . import android_environment, device, emulator
 
 # ---------------------------------------------------------------------------
 # Pinned versions. The single obvious place to change if this is ever updated.
@@ -533,39 +533,262 @@ def runners_already_installed(runners_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def format_environment_report(environment, runners_dir: Path,
+                              executorch_version: str) -> str:
+    """The status block printed at the top of every setup run.
+
+    Everything is inspected before anything is downloaded or built, so a
+    missing NDK is reported in seconds rather than after a gigabyte of clone.
+    """
+    def status(found: bool) -> str:
+        return "FOUND" if found else "MISSING"
+
+    host = environment.host
+    support = environment.emulator_support
+    lines = [
+        "DelegateDoctor Android Setup",
+        "",
+        "Host",
+        f"  OS                     {host.os_name}",
+        f"  Architecture           {host.architecture}",
+        "",
+        "Android",
+        f"  SDK                    {status(environment.has_sdk)}",
+    ]
+    if environment.sdk_root is not None:
+        lines.append(f"  Path                   {environment.sdk_root}")
+    for name in ("adb", "sdkmanager", "avdmanager", "emulator"):
+        lines.append(f"  {name:<22} {environment.tool(name).status}")
+    lines.append(f"  NDK                    {status(environment.ndk is not None)}")
+    if environment.ndk is not None:
+        lines.append(f"  NDK path               {environment.ndk}")
+    lines += [
+        f"  cmake                  {status(environment.cmake is not None)}",
+        f"  git                    {status(environment.git is not None)}",
+        "",
+        "Arm target",
+        f"  Arm64 emulator         {support}",
+    ]
+    if environment.can_manage_emulator and support != android_environment.SUPPORT_UNAVAILABLE:
+        lines.append(
+            f"  DelegateDoctor AVD     "
+            f"{status(emulator.avd_exists(environment))}")
+    lines += [
+        "",
+        "ExecuTorch",
+        f"  Python package         {executorch_version}",
+        f"  Pinned commit          {EXECUTORCH_COMMIT[:12]}",
+        f"  ETDump runner          "
+        f"{'READY' if (runners_dir / device.ETDUMP_RUNNER_NAME).is_file() else 'MISSING'}",
+        f"  Benchmark runner       "
+        f"{'READY' if (runners_dir / device.BENCH_RUNNER_NAME).is_file() else 'MISSING'}",
+    ]
+    return "\n".join(lines)
+
+
+def _confirm(question: str, interactive: bool, assume_yes: bool,
+             prompt=input) -> bool:
+    """Ask before installing anything. Never blocks when non-interactive."""
+    if assume_yes:
+        return True
+    if not interactive:
+        return False
+    try:
+        answer = prompt(f"{question} [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("", "y", "yes")
+
+
+# The one word a user has to read at the end of setup.
+READY = "READY"
+UNAVAILABLE = "UNAVAILABLE"
+
+
+def managed_environment_ready(runners_dir: Path, environment=None) -> bool:
+    """Can DelegateDoctor measure on its managed Arm64 emulator right now?
+
+    Every part has to be there: an SDK with the tools, a host that can give a
+    meaningful Arm emulator, the AVD itself, and both runners. Reporting READY
+    without the runners would send a user into a run that fails minutes later.
+    """
+    runners_dir = Path(runners_dir)
+    if not runners_already_installed(runners_dir):
+        return False
+
+    environment = environment or android_environment.detect()
+    if environment.emulator_support == android_environment.SUPPORT_UNAVAILABLE:
+        return False
+    if not environment.can_manage_emulator:
+        return False
+    return emulator.avd_exists(environment)
+
+
+def ensure_sdk(environment, interactive: bool, assume_yes: bool,
+               announce=print, prompt=input, home: Path = None):
+    """Report the SDK Android Studio installed, or stop and say what to do.
+
+    DelegateDoctor does not obtain an SDK. Android Studio's Setup Wizard is the
+    one manual Android prerequisite, and everything after it is DelegateDoctor's
+    job - but that first step is not, and pretending otherwise meant a second
+    onboarding path with its own download, its own checksum table and its own
+    failure modes.
+    """
+    if environment.has_sdk and environment.has_command_line_tools:
+        announce(f"\nAndroid Studio          PASS")
+        announce(f"Android SDK             PASS")
+        announce(f"SDK path                {environment.sdk_root}")
+        return environment
+
+    if environment.has_sdk:
+        # An SDK without command-line tools: Android Studio installed it but
+        # the Setup Wizard has not finished, or the component was deselected.
+        announce("\n" + android_environment.COMMAND_LINE_TOOLS_MISSING_MESSAGE)
+        return environment
+
+    announce("\n" + android_environment.SDK_MISSING_MESSAGE)
+    return environment
+
+
+def ensure_licenses(environment, interactive: bool, announce=print,
+                    prompt=input) -> bool:
+    """Licences accepted, or a clear stop. Never synthesized agreement."""
+    if emulator.licenses_accepted(environment):
+        return True
+    if not interactive:
+        announce("\n" + emulator.NONINTERACTIVE_LICENSES_MESSAGE)
+        return False
+    return emulator.accept_licenses_interactively(
+        environment, announce=announce, prompt=prompt)
+
+
+def provision_emulator(environment, interactive: bool, assume_yes: bool,
+                       announce=print, prompt=input) -> bool:
+    """Install emulator packages and create the managed AVD, with consent.
+
+    Returns True when the AVD is present afterwards. A host that cannot give a
+    meaningful Arm emulator is told so plainly and skipped - DelegateDoctor
+    will not substitute an x86_64 image.
+    """
+    support = environment.emulator_support
+    if support == android_environment.SUPPORT_UNAVAILABLE:
+        announce("\nARM64 EMULATOR UNAVAILABLE ON THIS HOST\n")
+        announce(environment.emulator_support_reason)
+        return False
+
+    if not environment.has_sdk:
+        announce("\n" + android_environment.SDK_MISSING_MESSAGE)
+        return False
+
+    if not environment.has_command_line_tools:
+        announce("\n" + android_environment.COMMAND_LINE_TOOLS_MISSING_MESSAGE)
+        return False
+
+    if support == android_environment.SUPPORT_UNTESTED:
+        announce("\nNOTE: " + environment.emulator_support_reason + "\n")
+
+    try:
+        missing = emulator.missing_packages(environment)
+    except emulator.EmulatorError as error:
+        # sdkmanager is present but unusable. Report it and carry on: the
+        # runner build below does not depend on the emulator at all.
+        announce(f"\nCould not inspect Android packages: {error}")
+        return False
+
+    if missing:
+        announce("\nMissing Android components:\n")
+        for package in missing:
+            announce(f"  {package}")
+        if not ensure_licenses(environment, interactive, announce, prompt):
+            return False
+        if not _confirm("\nInstall now?", interactive, assume_yes, prompt):
+            announce("\nSkipped. Install them yourself with:\n")
+            for package in missing:
+                announce(f"  sdkmanager --install \"{package}\"")
+            return False
+        emulator.install_packages(environment, missing, announce=announce)
+
+    if emulator.avd_exists(environment):
+        compatible, reason = emulator.avd_is_compatible(environment)
+        if compatible:
+            announce(f"\nDelegateDoctor AVD     FOUND ({emulator.AVD_NAME})")
+            return True
+        announce(f"\nDelegateDoctor AVD     INCOMPATIBLE\n\n  {reason}")
+        if not _confirm(f"\nRecreate {emulator.AVD_NAME}?", interactive,
+                        assume_yes, prompt):
+            return False
+        emulator.recreate_avd(environment, announce=announce)
+        announce(f"\nDelegateDoctor AVD     RECREATED ({emulator.AVD_NAME})")
+        return True
+
+    if not _confirm(f"\nCreate the {emulator.AVD_NAME} AVD now?",
+                    interactive, assume_yes, prompt):
+        announce(f"\nSkipped. Create it yourself with:\n\n"
+                 f"  avdmanager create avd --name {emulator.AVD_NAME} "
+                 f"--package \"{emulator.SYSTEM_IMAGE_PACKAGE}\"")
+        return False
+
+    emulator.create_avd(environment, announce=announce)
+    announce(f"\nDelegateDoctor AVD     CREATED ({emulator.AVD_NAME})")
+    return True
+
+
 def setup_android_runners(
     project_root: Path,
     runners_dir: Path,
     rebuild: bool = False,
     parallel_jobs: int = 10,
+    interactive: bool = False,
+    assume_yes: bool = False,
+    skip_emulator: bool = False,
+    announce=print,
+    prompt=input,
 ) -> int:
-    """Build and install both Android runners. Returns a process exit code."""
-    print("DelegateDoctor Android setup\n")
+    """Inspect the host, provision what is missing, build the runners.
 
-    # 1. Environment. All checks happen before anything is downloaded or built,
-    #    so a missing tool fails in seconds rather than after a long clone.
+    Ordered so nothing expensive happens before the environment is understood.
+    Idempotent: a second run reports FOUND/READY and exits quickly.
+    """
+    # 1. Look at everything first.
     installed_version = check_executorch_version()
-    print(f"Installed ExecuTorch: {installed_version} (supported)")
+    environment = android_environment.detect()
+    announce(format_environment_report(environment, runners_dir,
+                                       installed_version))
 
+    # 2. The SDK Android Studio installed. Nothing below can work without one.
+    environment = ensure_sdk(environment, interactive, assume_yes,
+                             announce=announce, prompt=prompt)
+    if not environment.has_sdk:
+        announce(format_verdict(runners_dir, environment))
+        return 2
+
+    # 3. Offer the emulator, when this host can give a meaningful one.
+    if not skip_emulator:
+        try:
+            provision_emulator(environment, interactive, assume_yes,
+                               announce=announce, prompt=prompt)
+        except emulator.EmulatorError as error:
+            announce(f"\nEmulator provisioning skipped: {error}")
+
+    # 3. The toolchain the runner build needs.
     check_command("git", "Install git and try again.")
     check_command(
         "cmake",
         "Install CMake and try again, e.g.\n    brew install cmake",
     )
     ndk_dir = find_android_ndk()
-    print(f"Android NDK:          {ndk_dir}")
-    print(f"Python:               {sys.executable}")
-    print(f"Target ABI:           {ANDROID_ABI}")
-    print(f"Source commit:        {EXECUTORCH_COMMIT}")
 
-    # 2. Skip the whole build if there is nothing to do.
+    # 4. Skip the whole build if there is nothing to do.
     if not rebuild and runners_already_installed(runners_dir):
-        print("\nProfiling runner already exists.")
-        print("Benchmark runner already exists.")
-        print("\nAndroid runner setup is complete.")
-        print(f"Runners: {runners_dir}")
-        print("\nRe-run with --rebuild to build them again.")
+        announce(f"Runners: {runners_dir}")
+        announce("Re-run with --rebuild to build them again.")
+        announce(format_verdict(runners_dir))
         return 0
+
+    announce(f"\nAndroid NDK:          {ndk_dir}")
+    announce(f"Python:               {sys.executable}")
+    announce(f"Target ABI:           {ANDROID_ABI}")
+    announce(f"Source commit:        {EXECUTORCH_COMMIT}")
 
     # 3. Source.
     build_dir = prepare_build_directory(project_root)
@@ -605,7 +828,45 @@ def setup_android_runners(
     print(f"  {benchmark_description}")
     print(f"\nExecuTorch source cached in {source_dir}")
     print("It is only needed to rebuild the runners; analysis does not read it.")
-    print("\nNext:\n"
-          "    python examples/<model>.py                          # a demo\n"
-          "    delegate-doctor optimize model.pt2 --inputs inputs.pt")
+    announce(format_verdict(runners_dir))
     return 0
+
+
+def format_verdict(runners_dir: Path, environment=None) -> str:
+    """One word, and what it means. The last thing setup prints.
+
+    READY means DelegateDoctor can measure on its managed Arm64 emulator right
+    now. UNAVAILABLE names the reason and what still works - which on an x86_64
+    host is a physical Arm64 phone, because an x86 emulator is never presented
+    as Arm evidence.
+    """
+    runners_dir = Path(runners_dir)
+    environment = environment or android_environment.detect()
+
+    if managed_environment_ready(runners_dir, environment):
+        return (
+            f"\nManaged Arm64 environment   {READY}\n"
+            f"\n"
+            f"    delegate-doctor optimize model.py --target emulator"
+        )
+
+    reasons = []
+    if not runners_already_installed(runners_dir):
+        reasons.append("the Arm64 runners are not built")
+    if environment.emulator_support == android_environment.SUPPORT_UNAVAILABLE:
+        reasons.append(environment.emulator_support_reason)
+    elif not environment.can_manage_emulator:
+        reasons.append("the Android command-line tools are not available")
+    elif not emulator.avd_exists(environment):
+        reasons.append(f"the {emulator.AVD_NAME} AVD does not exist")
+
+    listed = "\n".join(f"    {reason}" for reason in reasons)
+    return (
+        f"\nManaged Arm64 environment   {UNAVAILABLE}\n"
+        f"\n"
+        f"{listed}\n"
+        f"\n"
+        f"A physical arm64-v8a Android device over adb works either way:\n"
+        f"\n"
+        f"    delegate-doctor optimize model.py --target device"
+    )

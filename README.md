@@ -1,1062 +1,521 @@
 # DelegateDoctor
 
-**If PyTorch can export your model, DelegateDoctor can inspect the exported
-graph. It diagnoses the ExecuTorch/XNNPACK deployment path as far as the backend
-and your device allow — and when it recognises a proven repair, it verifies and
-benchmarks that repair on Arm before keeping it.**
+A diagnostic and repair tool for PyTorch models deployed to Arm64 Android through ExecuTorch and XNNPACK.
 
-```python
-from delegate_doctor import optimize
+DelegateDoctor exports your model, lowers it with the XNNPACK partitioner, runs it on a real Arm64 Android target, and measures where inference time actually goes. When a known graph pattern is starving the delegate, it rewrites the graph, verifies the rewrite against the original model on both host and device, benchmarks it on the Arm target, and keeps the change only if it is correct **and** faster.
 
-result = optimize(model, args=(example_input,))
+> **Not all fallbacks are equal. Optimize runtime, not operator counts.**
+
+```bash
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulator
 ```
 
-> Not all fallbacks are equal. Optimise runtime, not operator counts.
->
-> Analysis is the product. Optimization is an additional capability, not a
-> requirement for a useful answer.
+```
+[1] avg_pool2d.out          60.8%
+    DD-003 found
+    Applying to 9 matching sites...
+    Host correctness       PASS
+    Device correctness     PASS
+    p50                    96.68 -> 36.49 ms
+    Result                 ACCEPTED
+
+Runtime delegation      39.1% -> 99.8%
+Speedup                 2.65x
+```
+
+Every number above was measured on an Arm64 Android target, not estimated. Inference runs locally on the device, and the default workflow contacts no AI provider.
 
 ---
 
-## The Problem
+## Why DelegateDoctor
 
-When you lower a model to ExecuTorch with the XNNPACK backend, the partitioner
-accepts most operators and quietly refuses a few. The refused ones fall back to
-ExecuTorch's portable reference kernels: single-threaded C++ written for
-clarity, not speed.
+When you lower a PyTorch model to ExecuTorch with the XNNPACK backend, some operators are accepted into the delegate and some are not. The ones that are not fall back to ExecuTorch's portable kernels.
 
-The usual health check is *what fraction of operators got delegated?* That
-number is easy to compute and easy to misread. A model can be 96.8% delegated
-and still spend most of its life outside the delegate, because one refused
-operator sits on a huge tensor with a terrible memory access pattern.
+The usual way to report this is the fraction of operators that were delegated. That number is reassuring and frequently wrong.
 
-Operator counts weight every node equally. Hardware does not.
+Inception V3, measured:
 
-## What DelegateDoctor Does
+| | before repair |
+| --- | --- |
+| Operators delegated | **97.1%** (9 of 314 fell back) |
+| Runtime inside XNNPACK | **39.1%** |
 
-```
-nn.Module ─┐
-           ├─> ExportedProgram ─> ExecuTorch lowering ─> XNNPACK partition
-model.pt2 ─┘                                                   │
-                                                               v
-                              profile on device ─> rank hotspots by measured time
-                                                               │
-                                                               v
-                                        detect a known pattern ─> repair
-                                                               │
-                                                               v
-                             verify on host ─> verify on device ─> benchmark
-                                                               │
-                                                               v
-                                                        accept or reject
-```
+Nine `avg_pool2d` nodes out of 314 operators — under 3% of the graph — accounted for **60.8% of measured inference time**. A tool reporting operator counts would have called this model well optimized and moved on.
 
-It reports **runtime-weighted delegation** — the share of wall time actually
-spent inside XNNPACK, measured on the device with ETDump — and ranks every
-fallback by the milliseconds it costs. When it recognises a repairable pattern
-it rewrites the graph, then puts the result through three gates: host outputs
-must match, the tensors the **Android device actually produced** must match, and
-latency must improve. Failing any gate discards the repair.
+This happens because operator count says nothing about cost. One fallback on a large tensor can outweigh hundreds of delegated operators, and each fallback also splits the delegate into separate blobs, adding layout conversions at every boundary.
 
-Every stage reports its own outcome, so a model that exports but cannot be
-lowered, or lowers but cannot run on the attached target, still gets whatever
-analysis is possible — and the report says exactly where it stopped rather than
-calling the model unsupported.
+DelegateDoctor therefore ranks fallbacks by **measured runtime share** taken from ExecuTorch's ETDump profiler on the Arm target, and treats operator-count delegation as diagnostic only.
 
-## Demonstrated Result
-
-Real model, unmodified: `segmentation_models_pytorch` U-Net with a MobileNetV2
-encoder, 21 classes, 256x256 input. Measured on an Arm64 Android emulator.
-
-```
-Operator-count delegation:    96.8%  ->  97.4%      +0.6 points
-Runtime-weighted delegation:  34.3%  ->  93.2%
-
-p50 latency:                77.545 ms -> 26.853 ms  2.89x (65.4% lower)
-
-Host verification:   max abs error 1.863e-08, argmax agreement 100%
-Android verification: max abs error 1.863e-08, argmax agreement 100%
-REPAIR ACCEPTED
-```
-
-Operator-count delegation moved by 0.6 percentage points. A tool reporting only
-operator counts would have called this model already optimised. Median latency
-fell by roughly two thirds — because **one portable softmax accounted for 63.4%
-of runtime**.
-
-That gap is the whole point of the project.
-
-Full recorded run: [`results/example_run.txt`](results/example_run.txt).
-These are emulator numbers, not handset numbers — see [Limitations](#limitations).
-
-### The same rule across six architectures
-
-On a physical **RMX2030** (Snapdragon 665, arm64-v8a, Android 10), the *same*
-unchanged DD-001 rule was applied to six independent segmentation
-architectures. All six passed host and Android verification with 100% argmax
-agreement:
-
-| Architecture | Softmax runtime | Runtime delegation | p50 before → after | Speedup | Runs |
-| --- | ---: | ---: | ---: | ---: | :-: |
-| PSPNet | 38.0% | 61.9% → 99.4% | 242.69 → 65.53 ms | **3.794x** | median of 3 |
-| Linknet | 42.0% | 58.0% → 100.0% | 267.09 → 111.82 ms | **2.217x** | median of 3 |
-| DeepLabV3+ | 38.6% | 61.4% → 100.0% | 286.29 → 180.38 ms | 1.587x | single run |
-| FPN | 22.8% | 73.6% → 93.1% | 394.77 → 253.65 ms | 1.556x | single run |
-| U-Net | 20.8% | 75.1% → 94.0% | 459.61 → 338.10 ms | 1.359x | single run |
-| U-Net++ | 18.0% | 77.2% → 93.7% | 573.52 → 442.84 ms | 1.295x | single run |
-
-**Only PSPNet and Linknet are repeated medians** (3 runs each); the other four
-are single runs and should be read as indicative. The p50 columns show the
-first run in every case.
-
-The honest claim is not "DD-001 makes segmentation models faster". It is that
-DD-001 recognises the same backend-hostile class-softmax pattern across six
-independent architectures and repairs them all with one rule, with a benefit
-that depends on how expensive that fallback is in each model. Full method and
-caveats: [`results/dd001_segmentation_generalization.md`](results/dd001_segmentation_generalization.md).
-
-## How It Works
-
-**Profiling.** The model runs on the device under an ExecuTorch build with the
-event tracer on, producing an ETDump trace read back through
-`executorch.devtools.Inspector`.
-
-**Benchmarking.** A *second*, tracer-free build measures latency, so profiling
-instrumentation can never contaminate the number a decision rests on.
-
-**Repair.** A rule rewrites the exported ATen graph before lowering, and the
-repaired graph is then lowered and re-partitioned from scratch, so the
-improvement is measured rather than assumed. The original model is never
-re-traced — everything happens on the `ExportedProgram`.
-
-**Gates.** Outputs are compared element-wise on the host *and* on the Android
-device, using tensors pulled back over `adb`; latency is compared on the device.
-All must pass. A rewrite can be correct on the host and still hit a
-backend-specific bug, which is why the device check is part of the gate rather
-than a diagnostic.
+**Analysis is the product; optimization is an additional capability.** A run that finds no repair is still useful: you learn where the time goes, which operators XNNPACK declined, and what the ceiling would be if they were free.
 
 ---
 
-## Quick Start
-
-### Requirements
-
-| | |
-| --- | --- |
-| **Python** | **3.12** (validated on 3.12.7; enforced by `requires-python`) |
-| ExecuTorch | 1.4.0, installed automatically |
-| Android NDK | required by `setup-android` (tested with 27.2.12479018) |
-| CMake + git | required by `setup-android` |
-| Arm64 Android target | required for profiling and benchmarking, via `adb` |
-| Network | required the first time `setup-android` runs |
-
-### Install
-
-```bash
-git clone <repo-url>
-cd delegate-doctor
-
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-That installs DelegateDoctor and its core dependencies. The library itself
-needs no model zoo — `segmentation_models_pytorch`, `timm` and `torchvision` are
-only used by the demonstration scripts:
-
-```bash
-python -m pip install -e ".[examples]"    # to run examples/
-python -m pip install -e ".[dev]"         # to run the test suite
-```
-
-### Build Android runners
-
-```bash
-delegate-doctor setup-android
-```
-
-This downloads the exact pinned ExecuTorch source revision into the project's
-own ignored `.build/` directory and cross-compiles two `arm64-v8a` runners into
-`runners/`. It takes several minutes and roughly a gigabyte of download the
-first time.
-
-- **No Android device is needed for this step.** It is a build, not a run.
-- **No sibling `executorch/` checkout is required.** The source is fetched into
-  `.build/` automatically.
-- Re-running it is safe: if both runners are present it reports that and exits.
-  Use `--rebuild` to force a rebuild.
-
-If the NDK is not found, set one of `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT` or
-`ANDROID_NDK`:
-
-```bash
-export ANDROID_NDK_HOME="$HOME/Library/Android/sdk/ndk/27.2.12479018"
-```
-
-### Connect an Arm64 Android target
-
-DelegateDoctor executes the model on real Arm64 hardware, so profiling and
-benchmarking need a target:
-
-```bash
-adb devices
-adb shell getprop ro.product.cpu.abi     # must print arm64-v8a
-```
-
-- A **physical Arm64 Android phone is preferred** — it is the only way to get
-  representative performance numbers.
-- An **Arm64 Android emulator is acceptable** and is what the demonstrated
-  result above was measured on. The system image must be `arm64-v8a`; an x86_64
-  image will not work.
-
-To create and boot an emulator:
-
-```bash
-export ANDROID_HOME=/path/to/your/android/sdk
-
-sdkmanager --install "platform-tools" "emulator" "platforms;android-35" \
-                     "system-images;android-35;google_apis;arm64-v8a"
-avdmanager create avd -n dd_arm64 -k "system-images;android-35;google_apis;arm64-v8a"
-
-# the emulator binary usually lives in the SDK rather than on PATH
-"$ANDROID_HOME/emulator/emulator" -avd dd_arm64 -no-window -no-audio -no-snapshot -gpu off -cores 4 &
-adb wait-for-device
-```
-
-### Optimize your own model
-
-Hand DelegateDoctor the model object you already have in memory:
-
-```python
-from delegate_doctor import optimize
-
-result = optimize(model, args=(example_input,))
-
-result.open_report()             # opens report.html in your browser
-```
-
-The model executes and is measured on the Arm64 Android target. The report is
-generated **locally** and opens in your desktop browser; nothing is ever
-displayed on the phone, which is only the measurement target.
-
-The terminal stays short:
+## What it does
 
 ```
-DelegateDoctor - PSPNet
-
-Result                  REPAIR ACCEPTED
-Top hotspot             _softmax.out · 38.0% runtime
-Runtime delegation      61.9% -> 99.4%
-Latency                 242.69 -> 65.53 ms
-Speedup                 3.79x
-Correctness             PASS host / PASS device
-Repair applied          DD-001
-
-Optimized model         artifacts/run_042/optimized_model.pte
-Report                  artifacts/run_042/report.html
+PyTorch model (nn.Module)
+        |
+        v  torch.export
+   ExportedProgram
+        |
+        v  to_edge_transform_and_lower + XNNPACK partitioner
+   ExecuTorch .pte
+        |
+        v  run on Arm64 Android, ETDump event trace
+   profile
+        |
+        v  rank portable fallbacks by measured runtime share
+   hotspots
+        |
+        v  match against the repair catalog, rewrite the graph
+   candidate
+        |
+        +--> host correctness      vs the original program
+        +--> device correctness    vs the original, on the Arm target
+        +--> backend fidelity      how well the backend tracks PyTorch
+        +--> benchmark             p50, tracer-free runner, interleaved
+              |
+              +-- correct and faster ---> KEEP, re-profile, look again
+              `-- otherwise ------------> REJECT
 ```
 
-Everything else is in the result object and the run directory:
-
-```python
-print(result.status)             # e.g. REPAIR_ACCEPTED
-print(result.repair_available)   # did a catalog rule match?
-print(result.output_pte)         # path to the optimized .pte, or None
-print(result.report_path)        # path to report.html
-```
-
-It does not need to know how the model was built, how the checkpoint was
-loaded, or how your project is laid out — `torch.export` answers all of that by
-capturing the graph. Your architecture, your configuration, your trained
-weights, exactly as they are:
-
-```python
-model = MyModel(...)
-model.load_state_dict(torch.load("weights.pt", weights_only=True))
-
-result = optimize(model, args=(sample,))
-```
-
-Arguments mirror `torch.export.export`, so keyword inputs and dynamic shapes
-work the same way:
-
-```python
-optimize(model, args=(input_ids,), kwargs={"attention_mask": mask})
-
-batch = torch.export.Dim("batch", min=1, max=8)
-optimize(model, args=(x,), dynamic_shapes=({0: batch},))
-```
-
-**Your model object is not disturbed.** Export needs inference mode, so
-DelegateDoctor switches to `eval()` and switches back afterwards. It never
-writes to parameters or buffers, never moves your model between devices (it
-refuses and tells you to pass a CPU copy instead), and reads through a
-`DataParallel` wrapper rather than unwrapping it in place. Calling `optimize()`
-in the middle of a training script does not change what that script does next.
-
-### How far a model gets
-
-`torch.export.export()` is the acceptance boundary. If PyTorch can capture your
-model, DelegateDoctor accepts the graph and analyzes it as far as ExecuTorch,
-XNNPACK and the attached Arm target allow — then tells you exactly where it
-stopped:
-
-```
-PIPELINE
-----------------------------------------
-PyTorch export              PASS
-Graph inspection            PASS
-ExecuTorch lowering         PASS
-XNNPACK analysis            PASS
-  1 portable of 41 ops
-Android execution           UNSUPPORTED
-  input 0 is torch.int64; the Android input transport writes raw fp32
-  blobs with no dtype header
-Runtime profiling           NOT RUN
-Repair matching             PASS
-  DD-001 matched; not applied without a device benchmark
-Correctness verification    NOT RUN
-Device benchmark            NOT RUN
-
-RESULT
-----------------------------------------
-DEVICE_EXECUTION_UNSUPPORTED
-Static analysis complete. The Arm target could not run this model.
-```
-
-That is a **successful analysis**, not a failure. These are all separate things,
-and DelegateDoctor keeps them separate:
-
-| | |
-| --- | --- |
-| model exportable | `torch.export` captured the graph |
-| ExecuTorch-lowerable | ExecuTorch turned it into a runnable program |
-| runnable on the current Arm runner | inputs/outputs fit the device transport |
-| profileable | ETDump measured where the runtime went |
-| repair available | a catalog rule recognised a pattern |
-| repair correct | host and device outputs still match |
-| repair faster | the target benchmark improved |
-
-`result.status` is one of:
-
-| Status | Meaning |
-| --- | --- |
-| `REPAIR_ACCEPTED` | correct **and** faster on the device; `.pte` written |
-| `REPAIR_REJECTED` | a gate said no — the only non-zero CLI exit |
-| `NO_REPAIR_AVAILABLE` | hotspots ranked, but no rule matches them |
-| `NO_REPAIR_REQUIRED` | no portable hotspot to repair |
-| `FULLY_DELEGATED` | XNNPACK took every operator |
-| `ANALYSIS_COMPLETE` | static analysis done; device stages did not run |
-| `EXECUTORCH_LOWERING_UNSUPPORTED` | exported fine, ExecuTorch declined it |
-| `DEVICE_EXECUTION_UNSUPPORTED` | lowered fine, the target could not run it |
-
-Only `torch.export` failing raises, because then there is no graph to analyze:
-
-```
-PYTORCH EXPORT FAILED
-
-DelegateDoctor could not capture this model as a torch.export ExportedProgram.
-The model has not entered the DelegateDoctor analysis pipeline.
-```
-
-A repair is still only kept when it is **correct and measurably faster on your
-target**. Nothing about a graph looking cleaner, being more delegated, or having
-fewer partitions can accept a repair, and a repair that cannot be verified is
-never accepted.
-
-### The `.pt2` artifact path
-
-The same pipeline also takes a serialized graph, which is the reproducible,
-CI-friendly form — useful when optimization runs outside the process that
-trained the model:
-
-```python
-exported_program = torch.export.export(model.eval(), example_inputs)
-torch.export.save(exported_program, "model.pt2")
-torch.save(example_inputs, "inputs.pt")
-```
-
-```bash
-delegate-doctor optimize model.pt2 --inputs inputs.pt
-```
-
-```
-PyTorch nn.Module ──torch.export.export()──┐
-                                           ├──> ExportedProgram ──> DelegateDoctor
-model.pt2 ────────torch.export.load()──────┘                             │
-                                                                         v
-                                                        optimized ExecuTorch .pte
-```
-
-Both routes converge on the same `ExportedProgram` and the same pipeline; there
-is no second optimization engine. You do **not** need to create a `.pt2` to use
-the Python API.
-
-```
-.pt2 = PyTorch ExportedProgram   — the input to DelegateDoctor
-.pte = ExecuTorch program        — the output it produces
-```
-
-A `.pte` cannot be optimized. Its delegated regions are already compiled blobs,
-so there is no ATen graph left to repair — re-export from PyTorch instead.
-
-`examples/export_to_pt2.py` builds both files from a model class in a Python
-file, if you want a pair to try:
-
-```bash
-python examples/export_to_pt2.py --source examples/mnist.py \
-    --model Net --input-shape 1,1,28,28
-```
-
-#### The inputs file
-
-`inputs.pt` holds the positional arguments the exported program is called with:
-
-```python
-torch.save((torch.randn(1, 3, 224, 224),), "inputs.pt")
-```
-
-They are *representative* inputs, used for three jobs — host verification,
-device verification, and the benchmark — so the same tensors serve all three and
-every comparison is exact.
-
-The artifact path is deliberately **narrower than the Python API**: it accepts a
-tuple (or list) of positional fp32 tensors, or a single tensor. The Python API
-can accept anything `torch.export` accepts because it holds the real objects;
-`inputs.pt` has to be deserialized from disk, and that safety boundary is worth
-keeping tight.
-
-> **Deserialization.** `inputs.pt` is read with
-> `torch.load(..., weights_only=True)`, which restricts unpickling to tensors
-> and plain containers; an artifact holding custom objects is refused rather
-> than executed, and there is no fallback to unrestricted loading. `.pt2` is
-> read with `torch.export.load`, PyTorch's supported deserializer — still a
-> deserializer, so load `.pt2` files from sources you trust.
-
-Current device-stage limits (none of which stop the analysis):
-
-- the Android transport carries **positional fp32 tensors**; other dtypes and
-  keyword arguments are reported as an unsupported device stage
-- device verification reads back the **first output tensor**, so a model with
-  several outputs is analyzed and its verification honestly marked unsupported
-- your own models report tensor error only — no argmax/top-1 claim is made,
-  because DelegateDoctor does not know your output semantics
-
-## Try the examples
-
-Build the Android runners once, and connect an Arm64 target:
-
-```bash
-delegate-doctor setup-android
-
-adb devices
-adb shell getprop ro.product.cpu.abi     # must print arm64-v8a
-```
-
-Then run any example directly:
-
-```bash
-python examples/unet.py
-python examples/unetplusplus.py
-python examples/fpn.py
-python examples/pspnet.py
-python examples/deeplabv3plus.py
-python examples/linknet.py
-python examples/ghostnet.py           # DD-002 demonstration
-python examples/mobilenet_v2.py       # a healthy model: nothing to repair
-```
-
-They need the demo model libraries:
-
-```bash
-python -m pip install -e ".[examples]"
-```
-
-**Each script is an ordinary user of the public API.** Open any of them and the
-whole file is:
-
-```python
-from delegate_doctor import optimize
-
-model = build_model()      # a stock smp / timm / torchvision model
-model.eval()
-
-result = optimize(model, args=(example_input,))
-```
-
-There is no model-specific execution path inside DelegateDoctor. The core
-package contains no dispatch for U-Net, PSPNet, GhostNet or any other example
-model — it does not know they exist. `python examples/pspnet.py` is just
-*construct PSPNet → `optimize(model, args=(x,))`*, which is why the six
-segmentation examples are evidence that DD-001 is a real pattern rule rather
-than six hard-coded special cases. A regression test asserts the core has no
-architecture names in it.
-
-The six segmentation models all produce the DD-001 pattern naturally through the
-documented `activation="softmax2d"` option, each reaching it via its own
-decoder. GhostNet reaches DD-002 through timm's own `GhostModule` slice. Nothing
-is planted, and every run measures the connected device — nothing is
-pre-computed.
-
-`examples/mobilenet_v2.py` is the control: a mainstream mobile architecture
-XNNPACK takes completely, which should report `FULLY_DELEGATED` or
-`NO_REPAIR_REQUIRED` and produce no artifact. It is the one example that
-downloads pretrained weights (its own choice — DelegateDoctor never downloads
-anything); pass `weights=None` to stay offline.
-
-### Tuning a run
-
-Both the API and the CLI take the same benchmark controls:
-
-```python
-optimize(model, args=(x,), warmup_iterations=20, measured_iterations=150,
-         repetitions=3, threads=4, profile_iterations=20)
-```
-
-```bash
-delegate-doctor optimize model.pt2 --inputs inputs.pt \
-  --warmup 20 --iters 150 --reps 3 --threads 4 --profile-iters 20
-```
-
-CLI exit code is 0 for any completed analysis, 1 if a repair was rejected, and 2
-on a setup or input error.
-
-## The report
-
-Every run writes a self-contained `report.html` next to its other artifacts:
-
-```
-artifacts/run_042/
-├── report.html          concise visual summary, opens in any browser
-├── report.txt           the same run, section by section
-├── results.json         every measured number
-├── verification.json    host and device numerical comparison
-├── benchmark.json       raw per-repetition latencies
-├── optimized_model.pte  written only when a repair was accepted
-├── before/  after/      .pte, readable graphs, ETDump traces, profiles
-└── input0.bin           the exact bytes the device was fed
-```
-
-The report answers five questions on the first screen: is the deployment
-healthy, where is runtime going, did DelegateDoctor recognise a repair, did
-correctness survive, and did the target actually get faster. Its centrepiece is
-operator-count delegation shown beside runtime-weighted delegation, because that
-is where the two most often disagree.
-
-It is **fully self-contained** — all CSS inline, no JavaScript, no fonts, no
-images, no network. `file:///.../report.html` is enough, and it survives being
-emailed to a colleague. Deeper material (all portable operators, benchmark
-method, ExecuTorch version, artifact paths, patterns a rule declined) sits in a
-collapsed *Technical details* section so the first screen stays short.
-
-Open it however you like:
-
-```python
-result.open_report()          # from Python
-print(result.report_path)     # or just take the path
-```
-
-```bash
-delegate-doctor optimize model.pt2 --inputs inputs.pt --open-report
-```
-
-`optimize()` never opens a browser on its own — a CI job launching one would be
-a surprise. The examples call `open_report()` explicitly, which is what makes
-`python examples/pspnet.py` finish by showing you the result.
-
-Add `--verbose` (CLI) or `verbose=True` (Python) to print every section to the
-terminal as well; `quiet=True` silences it entirely.
-
-Normal runs also suppress a short allowlist of known-benign PyTorch/ExecuTorch
-diagnostics (a pytree deprecation, an ETDump debug-buffer notice, a CPU probe)
-so the console stays readable. Unknown warnings and errors are never suppressed,
-and `--verbose` restores everything. See `delegate_doctor/console_noise.py` for
-the exact list and the reason each entry is safe to hide.
-
-## Example Output
-
-The console after a run that found and kept a repair:
-
-```
-DelegateDoctor - U-Net / MobileNetV2
-
-Result                  REPAIR ACCEPTED
-Top hotspot             _softmax.out · 62.7% runtime
-Runtime delegation      35.0% -> 93.2%
-Latency                 77.55 -> 26.85 ms
-Speedup                 2.89x
-Correctness             PASS host / PASS device
-Repair applied          DD-001
-
-Optimized model         artifacts/run_001/optimized_model.pte
-Report                  artifacts/run_001/report.html
-```
-
-The same run, section by section, is in `report.txt`, and visually in
-`report.html`. A full recorded example - operator counts, hotspot ranking,
-verification metrics, per-repetition benchmark numbers and the decision - is
-checked in at [`results/example_run.txt`](results/example_run.txt).
-
-## Security
-
-DelegateDoctor has two input boundaries, and they have different properties.
-
-The **Python API** runs inside your own process, on an object you already
-constructed. It reads nothing from disk and deserializes nothing; the trust
-question is simply whether you trust the model you are holding.
-
-The **`.pt2` + `inputs.pt` artifact path** does deserialize, so that is where
-the restrictions live — and they stay narrow deliberately, even though the
-Python API is broader.
-
-- **No AI, no accounts, no telemetry.** There is no LLM, no cloud service and no
-  API key anywhere in the tool. Analysis and optimization are entirely
-  deterministic. The one thing that reaches the network is
-  `delegate-doctor setup-android`, which fetches the pinned ExecuTorch source
-  the first time you build the Arm64 runners.
-- **No repository ingestion.** DelegateDoctor does not clone, fetch or inspect
-  repositories. Remote inputs of any kind are rejected with a clear error.
-- **Inputs are loaded restrictively.** `inputs.pt` is read with
-  `torch.load(..., weights_only=True)`, so unpickling is limited to tensors and
-  plain containers. An artifact containing custom objects is refused rather than
-  executed, and there is **no fallback to unrestricted loading** — a test
-  asserts the flag is never set any other way.
-- **Everything is validated before anything expensive happens.** The `.pt2` must
-  load as an `ExportedProgram`, produce a callable module, accept the supplied
-  inputs and execute once — all before lowering, profiling or any device work.
-- DelegateDoctor **never installs dependencies** and **never downloads models,
-  checkpoints or inputs** automatically.
-
-### What this is not
-
-`torch.export.load` is PyTorch's supported deserializer for `.pt2`, and it is
-still a deserializer: it reads a serialized graph and its constants from a file.
-That is a much smaller surface than executing arbitrary Python — there is no
-model source being imported any more — but it is not zero. Load `.pt2` files
-from sources you trust, the same way you would treat any model checkpoint.
-
-## How it fits together
-
-```
-   nn.Module + args/kwargs                     model.pt2 + inputs.pt
-            |                                            |
-            v  torch.export.export()                     v  torch.export.load()
-            +--------------> ExportedProgram <-----------+
-                             (pristine baseline)
-                                    |
-                     +--------------+--------------+
-                     |                             |
-                     v                             v
-              baseline execution           ExecuTorch lowering
-                     |                        /          \
-                     |                    fail            pass
-                     |                     |               |
-                     |                     v               v
-                     |            report limitation   XNNPACK analysis
-                     |                                     |
-                     |                                     v
-                     |                          device / profile, if supported
-                     |                                     |
-                     |                                     v
-                     |                               Repair catalog
-                     |                          |- DD-001  non-last-dim softmax
-                     |                          |- DD-002  redundant no-op alias
-                     |                          `- future community repairs
-                     |                                /          \
-                     |                             none          match
-                     |                              |               |
-                     |                              v               v
-                     |                      NO REPAIR AVAILABLE  rewrite
-                     |                                              |
-                     +--> host + Android verification <-------------+
-                                    |    (against the pristine baseline)
-                                    v
-                          benchmark on YOUR target
-                                    |
-                          +--- slower --> REJECT
-                          |
-                          v faster
-                     optimized_model.pte
-```
-
-A repair rule is a **known safe optimization candidate, not a promise of
-universal speedup.** DelegateDoctor benchmarks every repair on your actual
-target before accepting it — the same bit-exact DD-002 repair measured 1.46x on
-one Arm64 target and was un-measurable on another.
+Repairs accumulate: after one is accepted the model is re-profiled, because removing a 60% hotspot changes every other percentage and can expose a fallback that was hidden behind it.
+
+---
+
+## Demonstrated results
+
+Three rules, validated across twelve model architectures. Emulator and physical-device measurements are never mixed.
+
+### DD-001 — physical device (RMX2030)
+
+One unchanged rule applied to six independent `segmentation_models_pytorch` architectures. All six matched the same pattern, were repaired by the same code with no architecture-specific branches, passed host and Android verification, and got faster on a physical phone.
+
+Target: RMX2030, Snapdragon SDM665, arm64-v8a, Android 10. Tracer-free runner, 4 threads, 20 warmup + 150 measured x 3 reps.
+
+| Architecture | Softmax runtime | Runtime delegation | p50 before | p50 after | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PSPNet | 38.0% | 61.9% → 99.4% | 242.69 ms | 65.53 ms | 3.703x |
+| Linknet | 42.0% | 58.0% → 100.0% | 267.09 ms | 111.82 ms | 2.389x |
+| DeepLabV3Plus | 38.6% | 61.4% → 100.0% | 286.29 ms | 180.38 ms | 1.587x |
+| FPN | 22.8% | 73.6% → 93.1% | 394.77 ms | 253.65 ms | 1.556x |
+| Unet | 20.8% | 75.1% → 94.0% | 459.61 ms | 338.10 ms | 1.359x |
+| UnetPlusPlus | 18.0% | 77.2% → 93.7% | 573.52 ms | 442.84 ms | 1.295x |
+
+Single runs, except PSPNet and Linknet, which were repeated three times: **median 3.794x** and **median 2.217x** respectively. PSPNet's spread across runs was wide (3.70–5.12x) — this is a phone under sustained load, so the median is the number to quote.
+
+Operator-count delegation moved by 0.5–1.5 points across these six models while runtime-weighted delegation moved by 16–42 points. That gap is the entire thesis of this project.
+
+Full record: [`results/dd001_segmentation_generalization.md`](results/dd001_segmentation_generalization.md)
+
+### DD-003 — Arm64 Android emulator
+
+The clearest illustration of runtime-weighted delegation. Measured on an Arm64 Android emulator (`sdk_gphone64_arm64`, arm64-v8a, Android 15) on an Apple Silicon host — **not a handset**.
+
+| Model | Sites repaired | Operator delegation | Runtime delegation | p50 | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Inception V3 | 9 | 97.1% → 100.0% | **39.1% → 99.8%** | 96.68 → 36.49 ms | **2.65x** |
+| DenseNet121 | 3 | 98.4% → 99.1% | 88.3% → 99.8% | 22.92 → 19.81 ms | 1.16x |
+| DenseNet169 | 3 | 98.8% → 99.3% | 89.8% → 99.9% | 27.48 → 24.86 ms | 1.11x |
+
+The rewrite is bit-exact: maximum absolute difference against the original is **0.000e+00** on all three models in eager PyTorch, across a sweep of nine input shapes crossed with five kernel/stride/padding combinations.
+
+DenseNet121 and DenseNet169 matter because DD-003 was never designed against them. They hit a different form of the same rule — zero padding, where the fix is a flag change and no node is added at all.
+
+Full record: [`results/dd003_avgpool_validation.md`](results/dd003_avgpool_validation.md)
+
+### DD-002 — Arm64 Android emulator
+
+Three timm GhostNet variants, bit-exact (0.000e+00 host and device), median 1.09–1.46x across three runs each; 8 of 9 runs favoured the repaired graph. The same repair on the physical RMX2030 was **inconclusive** — that phone's latency distribution was strongly bimodal (~44 ms and ~600 ms modes), and DelegateDoctor's own gate is what recorded the result as inconclusive rather than as a win.
+
+Full record: [`results/dd002_emulator_validation.md`](results/dd002_emulator_validation.md)
+
+A recorded end-to-end run, readable without running anything: [`results/example_run.txt`](results/example_run.txt)
+
+---
 
 ## Repair catalog
 
-Two accepted rules. Entering the catalog means a rule is correct and measurably
-faster on at least one supported Arm64 Android target — **not** that it is
-faster everywhere. DelegateDoctor always benchmarks original vs repaired on your
-device and rejects the repair if it does not win there.
+| Rule | Pattern it recognizes | Rewrite |
+| --- | --- | --- |
+| **DD-001** | `softmax` on a non-last dimension, which the XNNPACK partitioner declines | `view → permute → softmax(dim=-1) → permute → view` |
+| **DD-002** | A redundant `aten.alias` — an identity node that fragments the delegate | Delete the node and forward its input (1 op → 0 ops) |
+| **DD-003** | `avg_pool2d` with `count_include_pad=True`, rejected unconditionally by the partitioner | `avg_pool2d(constant_pad_nd(x, p, 0.0), k, s, padding=0, count_include_pad=False)` |
 
-| Rule | Pattern | Repair | Validated on |
-| --- | --- | --- | --- |
-| **DD-001** | softmax on a non-last dimension | axis canonicalization: `view → permute → softmax(-1) → permute → view` | 6 segmentation architectures, physical RMX2030, 1.30–3.79x |
-| **DD-002** | redundant `aten.alias` (a no-op that fragments the graph) | delete the node, forward its input (1 op → 0 ops) | 3 timm GhostNet variants, Arm64 **emulator**, 1.09–1.46x; physical phone inconclusive |
+Three things worth being precise about:
 
-DD-001 fixes an unsupported *configuration* of a real operator. DD-002 removes
-an operator that does nothing but split the delegate. Details:
-[`results/dd002_emulator_validation.md`](results/dd002_emulator_validation.md).
+**Rules are graph patterns, not architecture checks.** No model name, class name, module path or node index appears anywhere in the detection or rewrite logic — a test asserts this by scanning the package source. That is why one DD-001 implementation covers six unrelated segmentation architectures, and why DD-003 matched DenseNet without being written for it.
 
-## DD-001
+**A rule refuses what it cannot prove.** DD-003 only fires when `count_include_pad=True`, `ceil_mode=False`, `divisor_override` is unset, shapes are static, and padding is non-negative — each with a recorded reason when it declines. `ceil_mode=True` would let a pooling window overhang the padded edge, which pre-padding cannot reproduce, so those nodes are left alone.
 
-The first of the two repair rules, and the one with the broadest evidence.
+**A catalog match is not an acceptance.** It only means a candidate is worth measuring. The candidate then has to survive verification and beat the current model on the Arm target. DD-002 matched on the RMX2030 and was still not accepted there.
 
-**The problem.** ExecuTorch's XNNPACK partitioner delegates a softmax only when
-its target dimension is the **last** dimension. From
-`backends/xnnpack/partition/config/generic_node_configs.py`:
+---
+
+## Quick start
+
+Requirements:
+
+- **Python 3.12** (`>=3.12,<3.13` — the bound is deliberate and pip will enforce it)
+- **Android Studio**, with its initial Setup Wizard completed
+
+Android Studio's Setup Wizard is the one manual Android prerequisite. It installs the SDK that DelegateDoctor discovers via `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the standard install location for your platform. DelegateDoctor does not install an SDK of its own.
+
+### macOS on Apple Silicon
+
+```bash
+git clone <repository-url>
+cd delegate-doctor-repo
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[examples]"
+delegate-doctor check
+delegate-doctor setup-android
+```
+
+### Windows on Arm64 (PowerShell)
+
+```powershell
+git clone <repository-url>
+cd delegate-doctor-repo
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[examples]"
+delegate-doctor check
+delegate-doctor setup-android
+```
+
+### Which hosts are supported
+
+Your host architecture and your Android target architecture are separate things. DelegateDoctor always measures on an **arm64-v8a Android target**; the host only decides whether a *useful emulator* is available.
+
+| Host | Arm64 emulator | Notes |
+| --- | --- | --- |
+| macOS on Apple Silicon | Supported and validated | arm64-v8a system images run natively. All emulator evidence in this README was measured here. |
+| Windows or Linux on Arm64 | Implemented, **not validated** | Could in principle run arm64-v8a natively. DelegateDoctor has unit tests for the host-detection path, but it has never been exercised on real hardware. Prefer a physical device. |
+| Any x86_64 host | Not available | An arm64-v8a image would be emulated instruction by instruction, so its latency would measure the emulation rather than Arm. DelegateDoctor refuses to provision an x86_64 emulator and call it an Arm target. Connect a physical arm64-v8a device. |
+
+A physical arm64-v8a Android device works from any host.
+
+### What the two setup commands do
+
+`delegate-doctor check` is a fast local preflight. It reports your Python version, PyTorch, ExecuTorch, NumPy, pandas, the ETDump analysis path, `adb`, and the Android SDK, with a remedy for anything missing. It touches no network, no device and no API key.
+
+`delegate-doctor setup-android` provisions the Arm side: it reuses the SDK Android Studio installed, adds the pinned platform (API 35), the arm64-v8a system image and NDK 27.2.12479018, creates a `DelegateDoctor_ARM64` emulator where the host supports one, and cross-compiles the two ExecuTorch runner binaries. Your own AVDs and Android Studio settings are never modified.
+
+---
+
+## Run your first model
+
+A model that is already fully delegated — nothing to repair, and the analysis still tells you so:
+
+```bash
+delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py --target emulator
+```
+
+A model with a large, repairable fallback:
+
+```bash
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulator
+```
+
+The first reports high runtime delegation and no repair required. The second finds nine `avg_pool2d` fallbacks worth about 60% of runtime, repairs them in one candidate, verifies it, benchmarks it, and writes an optimized `.pte`.
+
+Use `--target device` instead of `--target emulator` to measure on a connected phone, or `--target auto` to let DelegateDoctor choose.
+
+---
+
+## Use your own model
+
+Put a Python file anywhere (`models/` is a git-ignored workspace kept for exactly this) that declares two functions:
 
 ```python
-if not (dim == -1 or dim == tensor_dims - 1):
-    why(node, reason="dim must be the last dim")
-    return False
+import torch
+from torchvision.models import resnet18
+
+
+def delegate_doctor_model():
+    model = resnet18(weights=None)
+    model.eval()
+    return model
+
+
+def delegate_doctor_inputs():
+    torch.manual_seed(0)
+    return (torch.randn(1, 3, 224, 224),)
 ```
 
-A softmax on any other axis falls back to the portable kernel. On the U-Net's
-`(1, 21, 256, 256)` tensor with `dim=1`, each of 65 536 softmax vectors has 21
-members that are 65 536 elements — 256 KB — apart, so effectively every element
-access is a cache miss, single-threaded.
-
-This is not an exotic shape. It is how essentially every multi-class
-segmentation model turns `(N, classes, H, W)` logits into probabilities.
-
-**The repair.** Move the softmax axis to the end, softmax there, move it back:
-
-```
-view(A, C, B) -> permute(0, 2, 1) -> softmax(-1) -> permute(0, 2, 1) -> view(original)
+```bash
+delegate-doctor optimize model.py --target emulator
 ```
 
-`view`, `permute` and last-dimension `softmax` all have XNNPACK partitioner
-configs, so the region rejoins the delegate. Softmax normalises independently
-along one axis, so this computes the same function; in fp32 the two paths differ
-only by kernel rounding.
+That is the whole contract. With those two functions present, preparation is fully deterministic and no AI is involved at any point.
 
-**Why it flattens to 3-D.** The obvious 4-D version,
-`x.permute(0, 2, 3, 1) -> softmax(-1) -> permute(0, 3, 1, 2)`, is mathematically
-identical, fully delegates, and on ExecuTorch 1.4.0 **silently produces wrong
-results** when the softmax input comes from a node XNNPACK evaluates in NHWC
-layout (any convolution, or a bilinear resize). Measured on a segmentation
-model: max absolute error 4.75e-02, and only 15.3% of pixels kept the correct
-predicted class. 3-D tensors are not subject to that channels-last tagging.
-`tests/test_dd001_rewrite.py` asserts DD-001 never emits a rank-4 permute.
+DelegateDoctor executes your `model.py` to build the model. It does so in a child process whose environment has credential-shaped variables removed, which keeps API keys and cloud secrets away from model code and keeps a crash out of DelegateDoctor's own process. That is a trust boundary, not an OS sandbox: running a model file runs its imports and its side effects, so treat a `model.py` the way you would treat any other Python you are about to run.
 
-**Where it runs.** DD-001 rewrites the `ExportedProgram` produced by
-`torch.export.export`, *before* `to_edge_transform_and_lower`. That is the last
-stage where the graph is still plain ATen operators. Once a `.pte` exists the
-delegated regions are opaque compiled blobs, so **DelegateDoctor cannot repair a
-`.pte` file** — it needs an `ExportedProgram`, from `torch.export.export` on a
-live model or `torch.export.load` on a `.pt2`.
+Two optional functions are also recognized:
 
-## Why Runtime-Weighted Delegation Matters
+```python
+def delegate_doctor_kwargs():          # keyword arguments for export
+    return {"attention_mask": mask}
 
-Measured, never estimated from operator types:
-
-1. Run on the device with the event-tracer runner, producing an ETDump trace.
-2. Read it with `executorch.devtools.Inspector`.
-3. Sum the top-level instruction events.
-
-Step 3 needs care, because ETDump events nest:
-
-```
-DELEGATE_CALL                       <- one whole XNNPACK blob (top level)
-    Convolution (NHWC, F32) IGEMM   <- XNNPACK's internal nodes
-OPERATOR_CALL                       <- one portable kernel (top level)
-    native_call__softmax.out        <- that kernel's own event
-Method::execute                     <- total for the inference
+def delegate_doctor_dynamic_shapes():  # forwarded to torch.export unchanged
+    return {"x": {0: torch.export.Dim("batch")}}
 ```
 
-Summing every row would count the same time two or three times. DelegateDoctor
-totals **only** the `DELEGATE_CALL` and `OPERATOR_CALL` rows:
+A dynamic graph is still analyzed, though a repair rule may decline to rewrite it — DD-003, for instance, requires static shapes to prove its rewrite is safe.
+
+### Python API
+
+If you already have the model object in memory:
+
+```python
+from delegate_doctor import optimize
+
+result = optimize(model, args=(example_input,))
+print(result.status, result.speedup)
+```
+
+`optimize()` takes your live `nn.Module`, so it needs no knowledge of how the model was built or how the checkpoint was loaded — `torch.export` captures the graph. It puts the module in eval mode for the export and restores its previous mode afterwards, and never writes to parameters or moves anything between devices.
+
+The CLI path is the recommended way to reproduce this project's results, because a model file is self-contained.
+
+---
+
+## Physical Android device
+
+Check that a device is attached and reports the right ABI:
+
+```bash
+adb devices
+adb shell getprop ro.product.cpu.abi
+```
+
+The second command must print `arm64-v8a`. Then:
+
+```bash
+delegate-doctor optimize model.py --target device
+```
+
+With several devices attached, pick one with `--device SERIAL`. Every report records the exact target it measured on, and emulator and physical-device results are labelled distinctly, so the two are never confused after the fact.
+
+---
+
+## What you get
+
+Each run writes a numbered directory under `artifacts/`:
+
+| File | Contents |
+| --- | --- |
+| `report.html` | Self-contained local report — delegation, hotspot ranking, every gate, the decision |
+| `report.txt` | The same run as plain text |
+| `results.json` | Machine-readable summary |
+| `repair_history.json` | Every repair attempted, its gates and its outcome, in order |
+| `step_NN/verification.json` | Host and device numerical comparison for that candidate |
+| `step_NN/benchmark.json` | Per-repetition latency samples |
+| `step_NN/trace.etdump` | The raw ExecuTorch profiler trace |
+| `optimized_model.pte` | **Only written when a repair was verified and faster** |
+
+`report.html` is a single file with no external requests, so it can be opened offline or attached to a ticket. It opens automatically when a run finishes; `--no-open-report` suppresses that.
+
+---
+
+## How acceptance works
+
+Four questions, asked in this order. Correctness is always measured against the ORIGINAL model, never against the previously accepted step, so drift cannot accumulate across several repairs.
+
+**1. Host correctness.** Both `.pte` files run through ExecuTorch's Python runtime and their outputs are compared. Tolerance is `1e-5` maximum absolute error, plus 100% argmax agreement when the model has a class dimension. Failing here rejects the candidate immediately, with no device work.
+
+**2. Device correctness.** Both programs run on the Arm target, their real output tensors are pulled back over `adb`, and the repaired output is compared against the original's — using the same tolerance. This catches a backend-specific problem the host cannot see. Failing here also rejects immediately, before the benchmark.
+
+**3. Backend fidelity.** A separate question: how closely does ExecuTorch/XNNPACK reproduce PyTorch, for the **original** as well as the candidate? This is a property of the model and the backend, not of a rewrite. Inception V3's untouched original already sits 1.19e-05 from PyTorch eager before anything is changed, because fp32 reassociation accumulates across 300+ operators.
+
+A pre-existing discrepancy is reported as a `WARNING` and does not reject anything. A discrepancy the *candidate* introduced — appearing where the original was clean, or more than 10x the original's — is a rejection. The tolerance is unchanged; only the attribution is.
+
+**4. Benchmark.** p50 latency on the Arm target, tracer-free runner, before and after interleaved across repetitions so device drift affects both equally.
+
+```
+More delegation alone never accepts a repair.
+```
+
+Delegation percentage is not an input to the decision. Both failure modes behind that rule were observed during development and are regression-tested: a bit-exact rewrite that improved every structural metric and ran 19% *slower*, and a rewrite that was dramatically faster, fully delegated, and silently corrupted 85% of output pixels.
+
+---
+
+## Why runtime-weighted delegation matters
+
+ExecuTorch's ETDump emits one event per executed instruction, and the events are **nested**. A single inference produces something like:
+
+```
+DELEGATE_CALL                     <- one whole XNNPACK blob   (top level)
+    (its internal ops)
+OPERATOR_CALL                     <- one portable operator    (top level)
+    native_call__softmax.out      <- that kernel's own event  (nested)
+```
+
+Summing every row double-counts, because the nested rows are already inside their parents. DelegateDoctor totals only the top-level `DELEGATE_CALL` and `OPERATOR_CALL` rows:
 
 ```
 runtime-weighted delegation = sum(DELEGATE_CALL) / (sum(DELEGATE_CALL) + sum(OPERATOR_CALL))
 ```
 
-and cross-checks that against `Method::execute`, warning if they disagree by
-more than 5%. Per-event times use the **median** across traced iterations, since
-the runner has no warmup flag and a cold first iteration can swing a mean by
-tens of percent. The nested `native_call_*` rows say *which* portable kernel
-burned the time, turning a percentage into a ranked hotspot list.
+and cross-checks the total against `Method::execute`, so a trace that does not add up is reported rather than silently averaged. The nested `native_call_*` rows are still read — they are what identify *which* operator a portable cost belongs to, and they carry per-site costs, so a model with twenty-four layer norms can be told apart from one expensive one.
 
-## Correctness and Benchmark Gates
+Profiling uses a separate event-tracer runner. Benchmarks use a tracer-free runner, so instrumentation can never influence a latency number.
 
-A repair is kept only if it passes both.
+---
 
-Correctness is checked **twice**, on the host and on the Android device.
+## Examples
 
-**Host gate** (`delegate_doctor/verification.py`). Both `.pte` files run through
-ExecuTorch's Python runtime and their outputs are compared. Thresholds are at the
-top of the module:
+Grouped by what they demonstrate. All but one declare the DelegateDoctor model interface and run with no AI involved.
 
-```python
-MAX_ABSOLUTE_ERROR_TOLERANCE = 1e-5   # ~100x fp32 epsilon
-REQUIRED_ARGMAX_AGREEMENT = 1.0       # every pixel keeps its predicted class
+**DD-001 — non-last-dimension softmax**
+
+```bash
+delegate-doctor optimize examples/dd001_softmax/interface_mnist.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/unet.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/unetplusplus.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/fpn.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/pspnet.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/deeplabv3plus.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/linknet.py --target emulator
 ```
 
-**Device gate** (`delegate_doctor/device_verification.py`). A graph rewrite can
-be mathematically equivalent and still trigger a device- or backend-specific
-correctness bug — the Android build of XNNPACK is different compiled code on a
-different architecture. DelegateDoctor therefore runs both `.pte` files on the
-Arm64 target, pulls the real output tensors back with `adb`, and checks them
-using the same thresholds:
+`interface_mnist.py` is the smallest — a handful of layers, no model library, fastest to run first.
 
-- repaired vs original, both measured **on the device** — did the repair change
-  the answer on real hardware?
-- each model's device output vs its own host output — this separates "the repair
-  is wrong" from "the backend is wrong".
+**DD-002 — redundant alias**
 
-This is a separate, untimed invocation. The timed benchmark still runs with
-`--print_output none` and writes no tensors, so output capture cannot pollute
-latency numbers.
-
-**Performance gate** (`delegate_doctor/benchmarking.py`). Both `.pte` files are
-benchmarked on the device under identical conditions — same input bytes, same
-thread count, same runner — interleaved before/after across repetitions so drift
-hits both equally.
-
-**Decision** (`delegate_doctor/decision.py`):
-
-```python
-def decide_repair(
-    host_verification_passed,
-    device_verification_passed,
-    before_latency_ms,
-    after_latency_ms,
-) -> RepairDecision
+```bash
+delegate-doctor optimize examples/dd002_alias/ghostnet.py --target emulator
 ```
 
-A repair is accepted only when **host verification passes, Android verification
-passes, and p50 latency improves**. A repair that improves delegation, runs
-nearly 3x faster and verifies on the host is still rejected if the tensors the
-device produced do not verify.
+**DD-003 — avg_pool2d padding**
 
-Note what is *not* a parameter: delegation. It is diagnostic, never an
-acceptance criterion. Both rejection paths exist because both were needed for
-real during development, and both are regression-tested:
+```bash
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulator
+delegate-doctor optimize examples/dd003_avgpool/densenet169.py --target emulator
+```
 
-- a **bit-exact** rewrite that improved every structural metric — delegate blobs
-  4 -> 1, portable operators 3 -> 0, operator delegation 87.5% -> 100% — and ran
-  **19% slower**;
-- a rewrite that was **~30x faster**, fully delegated, and corrupted 85% of
-  output pixels.
+**Already fully delegated** — the healthy case, where the useful output is the analysis
 
-## Project Structure
+```bash
+delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py --target emulator
+delegate-doctor optimize examples/fully_delegated/resnext50_32x4d.py --target emulator
+```
+
+**Fallbacks with no known repair** — an honest negative result
+
+```bash
+delegate-doctor optimize examples/no_repair/convnext_small.py --target emulator
+```
+
+**A model file with no interface** — `examples/ai_adapter/densenet121.py` deliberately declares neither `delegate_doctor_model()` nor `delegate_doctor_inputs()`. It exists to demonstrate the case optional AI preparation handles; see below.
+
+The six DD-001 segmentation models need the `examples` extra (`segmentation_models_pytorch`); `ghostnet.py` additionally needs `timm`. `inception_v3.py`, `mobilenet_v2.py` and `convnext_small.py` build with pretrained weights, so their first run downloads a checkpoint from the PyTorch hub; the rest use random weights and need no network.
+
+---
+
+## Optional: AI-assisted preparation
+
+The deterministic model interface above is the preferred and documented path, and nothing in the normal workflow requires AI.
+
+Some ordinary model files do not declare it — `examples/ai_adapter/densenet121.py` is one, defining a plain `nn.Module` subclass and nothing else. For those, DelegateDoctor can optionally use an AI provider to work out how to construct and export the model, producing an adapter. Sharing your model **source** for that purpose is consented separately from enabling AI repair; agreeing to one is not agreeing to the other.
+
+This is model *preparation*. It is not the experimental AI repair described next, and the two are separately controlled: `--ai-repair` never authorizes sending source, and consenting to send source never enables AI repair.
+
+Consent is requested interactively and defaults to no. In a `--non-interactive` run there is no one to ask, so preparation stops unless you also pass `--allow-ai-source`.
+
+```bash
+delegate-doctor configure-ai      # choose a provider and model
+```
+
+Bring your own key. DelegateDoctor ships no key, owns no account and stores no credential; you supply one through the environment when you want AI:
+
+```bash
+python -m pip install -e ".[ai,examples]"
+export DELEGATE_DOCTOR_LLM_API_KEY="..."
+```
+
+---
+
+## Experimental: AI repair
+
+**This is an experimental, opt-in feature. It is off by default and is not required to use DelegateDoctor.** Everything above works without it.
+
+```bash
+delegate-doctor optimize model.py --target emulator --ai-repair
+```
+
+Without `--ai-repair`, no provider is contacted and no proposal is requested, whatever the profile shows.
+
+How it is constrained:
+
+- **Known rules run first, always.** AI is consulted only once no catalog rule matches what remains. A hotspot a rule recognizes is never sent to a provider, even if that rule's repair was rejected — a rejection is an answer, not an invitation to guess.
+- **Model-level eligibility.** Exploration is offered only when portable execution still exceeds 5% of measured runtime.
+- **Bounded context.** The provider receives graph structure, shapes, dtypes and the measured profile. It does not receive weights, tensor values, checkpoints, your filesystem or environment variables.
+- **A constrained proposal format.** A proposal is expressed as four operation types (`insert_aten_call`, `replace_uses`, `replace_argument`, `erase_node`) over a 24-entry ATen allowlist, applied by table lookup. There is no arbitrary Python, no `eval`, no imports, no shell and no tools.
+- **The same gates as everything else.** An AI proposal becomes an ordinary candidate and meets the identical host, device, backend-fidelity and benchmark gates. There is no separate AI verification path and no reason for one.
+- **Not finding anything is a normal outcome.** A provider error, an empty response, or an explicit "no safe repair" are each reported as themselves, and the run finishes with whatever deterministic repairs it already made.
 
 ```
-delegate-doctor/
-├── delegate_doctor/
-│   ├── __init__.py          the public API: optimize(), OptimizationResult
-│   ├── api.py               live nn.Module -> torch.export -> pipeline
-│   ├── pipeline.py          the one stage machine every entry point runs
-│   ├── result.py            stage outcomes and the structured result
-│   ├── capabilities.py      what the Android transport can carry today
-│   ├── cli.py               optimize (.pt2) / setup-android
-│   ├── pt2_input.py         load and validate model.pt2 + inputs.pt
-│   ├── android_setup.py     fetch pinned ExecuTorch source, build runners
-│   ├── export_model.py      ModelSpec, XNNPACK lowering, .pte
-│   ├── delegation.py        operator-count delegation
-│   ├── profiling.py         ETDump -> runtime-weighted delegation, hotspots
-│   ├── verification.py      the host numerical gate
-│   ├── device_verification.py  pull Android tensors and check them
-│   ├── benchmarking.py      on-device latency, tracer-free
-│   ├── decision.py          accept / reject
-│   ├── device.py            adb and runner discovery
-│   ├── reporting.py         terminal report + JSON
-│   └── repairs/
-│       ├── dd001_softmax.py    DD-001 detection and rewrite
-│       └── dd002_noop_alias.py DD-002 detection and rewrite
-├── examples/                standalone scripts; ordinary users of optimize()
-│   ├── unet.py  unetplusplus.py  fpn.py           DD-001 demonstrations
-│   ├── pspnet.py  deeplabv3plus.py  linknet.py
-│   ├── ghostnet.py                                DD-002 demonstration
-│   ├── mobilenet_v2.py                            healthy baseline
-│   └── export_to_pt2.py     make model.pt2 + inputs.pt from a model class
-├── tests/
-├── runners/                 built by setup-android (git-ignored)
-├── artifacts/               per-run output (git-ignored)
-└── results/example_run.txt  recorded evidence from an earlier run
+The agent proposes.
+DelegateDoctor verifies.
+The Arm target decides.
 ```
+
+This repository contains no measured evidence of an accepted AI repair. The deterministic rules are what the results above demonstrate.
+
+---
+
+## Reproducibility
+
+- **ExecuTorch is pinned** to 1.4.0, commit `3dd7ccd1d863fad22639dd2d918ae34a41ce45f0`, which is what `setup-android` checks out and builds. `executorch==1.4.0` pulls torch 2.13.0 itself.
+- **Two runner binaries, never merged.** `executor_runner_etdump` has the event tracer compiled in and is used only for profiling; `executor_runner_bench` has it off and is used only for timing. A single instrumented binary would quietly tax every latency measurement.
+- **The Arm target is recorded** in every report — model, ABI, Android version, thread count, and whether it was an emulator.
+- **Benchmarks are interleaved.** Default 20 warmup + 150 measured iterations x 3 repetitions, before and after alternating within each repetition, identical input bytes and thread count. p50 is reported, not the mean. Tunable with `--warmup`, `--iters`, `--reps`, `--threads`.
+- **Device verification is a separate, untimed invocation** that writes output tensors; the timed benchmark writes none.
+
+<details>
+<summary>What <code>setup-android</code> installs</summary>
+
+Into the SDK Android Studio already installed:
+
+- `platforms;android-35`
+- `system-images;android-35;google_apis;arm64-v8a`
+- `ndk;27.2.12479018`
+- an AVD named `DelegateDoctor_ARM64`, only where the host can run arm64-v8a natively
+
+It then fetches the pinned ExecuTorch commit into `.build/` and cross-compiles the two runners into `runners/`. Both directories are git-ignored. `--rebuild` forces a rebuild, `--skip-emulator` builds only the runners, and `--jobs N` controls compile parallelism.
+
+</details>
+
+---
 
 ## Testing
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m pytest tests -q
+python -m pip install -e ".[dev,examples]"
+python -m pytest tests/ -q
 ```
 
-The suite is fully offline and deterministic: no network, no Android NDK, no
-emulator, no `adb`, no ExecuTorch source checkout, no AI of any kind. Subprocess
-and filesystem boundaries are mocked.
+1267 tests. The suite is fully offline: no Android device, no emulator, no NDK, no network and no API key. Device mechanisms are mocked; `torch.export`, lowering and the repair rules run for real.
 
-- `test_live_api.py` — `from delegate_doctor import optimize`; the caller's
-  training mode, parameters and DataParallel wrapper survive untouched; multiple
-  args, kwargs and `dynamic_shapes` reach `torch.export`; export failure is
-  framed as an export failure; int64 inputs and multi-output models are analyzed
-  rather than rejected; the live and `.pt2` paths produce equivalent specs and
-  identical repair detection.
-- `test_pipeline_stages.py` — every stage outcome: a mocked lowering failure
-  becomes `EXECUTORCH_LOWERING_UNSUPPORTED` (and does not blame `torch.export`),
-  a missing device leaves static analysis intact and applies no repair, an
-  unsupported input dtype or unverifiable output blocks acceptance without
-  faking a PASS, plus the fully-delegated and no-repair-available outcomes.
-- `test_pt2_input.py` — the artifact boundary: valid `.pt2` round-trips to an
-  `ExportedProgram`; URLs, directories, missing files, wrong suffixes, a `.pte`
-  passed as a `.pt2`, FIFOs and corrupt archives are each refused with their own
-  message. Inputs: tensor tuples, lists and bare tensors accepted; dicts,
-  non-tensors, empty tuples, non-fp32 and non-finite values rejected. Also
-  asserts `weights_only=True` is how inputs are loaded and that no unrestricted
-  fallback exists.
-- `test_pipeline_boundary.py` — the pristine baseline survives a repair, the
-  repaired graph really did change, lowering does not disturb the baseline, both
-  rules still accept a `.pt2`-loaded program, and the CLI surface removed in the
-  move to `.pt2` (the old AI-setup subcommand, its flags, and repository URLs)
-  no longer resolves.
-- `test_dd001_detection.py` — rank-4 `dim=1` detected, rank-7 non-last detected,
-  last-dim not detected, unsupported rank and dynamic shapes rejected clearly.
-- `test_dd001_rewrite.py` — shapes and values preserved, softmax becomes a
-  last-dim softmax, and no rank-4 permute is ever emitted.
-- `test_dd002_noop_alias.py` — the no-op alias rule, including the cases it
-  declines.
-- `test_verification.py` — rounding noise passes; a transposed output fails; a
-  change too small to breach the error budget still fails if it flips a class.
-- `test_decision_gate.py` — the four correct/incorrect x faster/slower
-  combinations, plus regression tests for both real failures above.
-- `test_device_verification.py` — binary tensor parsing (truncated, empty,
-  oversized, wrong dtype), adb command construction with the selected serial,
-  distinct before/after filenames, and the device checks that reject a wrong
-  Android tensor. Includes a guard that the timed benchmark never gains
-  `--output_file`.
-- `test_android_setup.py` — version pinning, tool and NDK discovery, source
-  checkout logic, runner install and verification, idempotence, CLI dispatch.
-- `test_examples.py` — every example is a standalone script that imports the
-  public `optimize`, calls it with `args=`, and reaches past nothing private;
-  and the core package has no architecture names in its code, no model-name
-  dispatch, no demo-library imports, and no `doctor` subcommand.
-- `test_reporting_output.py` — the concise console output.
-
-## Reproducibility
-
-The native runners are built from an exact pinned revision, declared in
-`delegate_doctor/android_setup.py`:
-
-```python
-SUPPORTED_EXECUTORCH_VERSION = "1.4.0"
-EXECUTORCH_COMMIT = "3dd7ccd1d863fad22639dd2d918ae34a41ce45f0"
-```
-
-`setup-android` refuses to run if the installed ExecuTorch Python package is not
-1.4.0. Building a native runtime from a different revision than the Python
-package can produce wrong answers rather than an obvious failure, so it stops
-rather than guessing.
-
-Two runners are built, differing in exactly one CMake flag:
-
-| | `EXECUTORCH_ENABLE_EVENT_TRACER` | used for |
-| --- | --- | --- |
-| `runners/executor_runner_etdump` | `ON` | ETDump profiling |
-| `runners/executor_runner_bench` | `OFF` | latency benchmarking |
-
-They are kept separate because the tracer adds per-instruction overhead. A
-single instrumented binary would quietly corrupt every latency measurement.
+---
 
 ## Limitations
 
-- **Two repair rules.** DD-001 and DD-002. `ALL_RULES` is a plain list — no rule
-  registry or plugin system, on purpose.
-- **ExecuTorch + XNNPACK only.** DelegateDoctor analyzes this one deployment
-  path, and ExecuTorch may still decline a graph PyTorch exported happily.
-- **Cannot repair a `.pte`.** Its delegated regions are already compiled blobs.
-  Export a `.pt2` from PyTorch instead.
-- **The device stages are narrower than the analysis.** The Android transport
-  carries positional fp32 tensors, and device verification reads back the first
-  output tensor. Other dtypes, keyword arguments and richer output structures
-  are analyzed and then honestly reported as unsupported device stages — they no
-  longer stop a model at the door, but they do stop it short of a benchmark.
-- **A repair needs the device.** Detection is static, but acceptance requires
-  host correctness, device correctness and a faster device benchmark. With no
-  Arm64 target attached, a matched rule is reported as a candidate and nothing
-  is applied.
-- **DD-001 declines dynamic shapes.** A dynamic graph is still exported,
-  lowered and analyzed; the rule simply will not rewrite it rather than baking
-  in a traced size.
-- **Your models get no argmax check.** The demo catalog knows its own output
-  semantics and checks class agreement; a model DelegateDoctor has never seen is
-  verified on tensor error alone.
-- **The graph is fixed at export time.** DelegateDoctor analyzes exactly the
-  graph `torch.export` captured. If the export took the wrong branch, shape or
-  configuration, the tool has no way to know — re-export instead.
-- **Python 3.12 only**, and **ExecuTorch 1.4.0 only**. Both are enforced rather
-  than assumed.
-- **The demonstrated numbers come from an Arm64 Android emulator, not a
-  handset.** Arm64 code runs natively on an Apple Silicon host, but cache sizes,
-  memory bandwidth and CPU scheduling differ from a phone. The direction and
-  rough scale of the effect are sound; treat the exact multiplier as provisional
-  until re-measured on real hardware. A physical device works through the same
-  `adb` path with no code changes.
-- **Device verification covers the first output tensor, fp32 only.** The Android
-  runner writes raw bytes with no dtype tag, so the expected dtype, shape and
-  byte count come from the host result and anything else is rejected rather than
-  reinterpreted.
-- **First `setup-android` needs network and an NDK**, and downloads roughly a
-  gigabyte into `.build/`.
-- **Runner architecture verification depends on the host `file` tool**; where it
-  is unavailable, setup says the architecture was not checked rather than
-  implying it was.
-- **Not a general graph optimizer**, and not intended to become one.
+- **ExecuTorch + XNNPACK only.** This is the one deployment path DelegateDoctor understands. Other backends and other runtimes are out of scope.
+- **The repair catalog is small** — three rules. A model whose fallbacks are not among them gets analysis and an honest "no known repair", which is a real answer but not a faster model.
+- **A device is required to accept a repair.** Correctness and speed are both measured on the target, so without one you get static analysis only.
+- **Emulator performance is not handset performance.** Arm64 code runs natively on an Apple Silicon host, but cache sizes, memory bandwidth and scheduling differ from a phone. Emulator numbers demonstrate direction and magnitude, not handset latency.
+- **Device verification reads the first output tensor**, as fp32. A model with several outputs is still analyzed and benchmarked; its device verification is marked unsupported rather than guessed at.
+- **Python 3.12 only**, and ExecuTorch 1.4.0 exactly. Both bounds are enforced by the packaging, so a mismatch is a clear error rather than a subtly different environment.
+- **No `.pte` entry point.** DelegateDoctor repairs the exported graph, and a `.pte`'s delegated regions are already compiled blobs. Point it at the PyTorch model instead.
+- **Windows and Linux on Arm64 are unvalidated.** The host-detection path has unit tests, but no measurement has ever been taken on either.
 
-## Advanced / Manual Runner Build
-
-Most users never need this — `setup-android` automates exactly these commands.
-They are kept for auditing what setup does and for building against a modified
-ExecuTorch tree. The clone directory **must** be named `executorch`; the
-ExecuTorch build enforces it.
-
-```bash
-git init executorch && cd executorch
-git remote add origin https://github.com/pytorch/executorch.git
-git fetch --depth 1 origin 3dd7ccd1d863fad22639dd2d918ae34a41ce45f0
-git checkout FETCH_HEAD
-git submodule update --init --recursive --depth 1
-
-export ANDROID_NDK="$ANDROID_NDK_HOME"
-export PY="$(which python)"     # the project's virtualenv interpreter
-
-# (A) tracer-free build, used for benchmarking
-cmake -S . -B cmake-out-android-bench \
-  -DEXECUTORCH_BUILD_PRESET_FILE=tools/cmake/preset/android.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-  -DANDROID_PLATFORM=android-28 -DCMAKE_BUILD_TYPE=Release \
-  -DEXECUTORCH_BUILD_EXECUTOR_RUNNER=ON \
-  -DEXECUTORCH_BUILD_EXTENSION_EVALUE_UTIL=ON \
-  -DEXECUTORCH_ENABLE_EVENT_TRACER=OFF \
-  -DEXECUTORCH_BUILD_ANDROID_JNI=OFF -DEXECUTORCH_BUILD_EXTENSION_LLM=OFF \
-  -DEXECUTORCH_BUILD_EXTENSION_LLM_RUNNER=OFF -DEXECUTORCH_BUILD_KERNELS_LLM=OFF \
-  -DEXECUTORCH_BUILD_EXTENSION_TRAINING=OFF -DPYTHON_EXECUTABLE=$PY
-cmake --build cmake-out-android-bench -j10
-
-# (B) event-tracer build, used for profiling: same command with
-#     -B cmake-out-android-etdump and -DEXECUTORCH_ENABLE_EVENT_TRACER=ON
-```
-
-The android preset keeps XNNPACK, optimized kernels and quantized kernels on,
-matching what ExecuTorch ships in its Android AAR. The LLM and training
-extensions are off purely to shorten the build.
-
-Install the results under the names DelegateDoctor expects, optionally stripped:
-
-```bash
-STRIP="$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-strip
-$STRIP cmake-out-android-bench/executor_runner  -o <project>/runners/executor_runner_bench
-$STRIP cmake-out-android-etdump/executor_runner -o <project>/runners/executor_runner_etdump
-```
-
-`--runners-dir` points elsewhere if you prefer.
+---
 
 ## License
 

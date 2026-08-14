@@ -181,8 +181,8 @@ def test_rule_identity_and_kernel_matching():
     assert not dd001_softmax.matches_portable_kernel("native_call_alias_copy.out")
 
 
-def test_both_rules_are_registered_in_order():
-    assert [rule.RULE_ID for rule in ALL_RULES] == ["DD-001", "DD-002"]
+def test_the_rules_are_registered_in_order():
+    assert [rule.RULE_ID for rule in ALL_RULES] == ["DD-001", "DD-002", "DD-003"]
     for rule in ALL_RULES:
         assert hasattr(rule, "detect") and hasattr(rule, "apply")
         assert hasattr(rule, "describe_rewrite")
