@@ -398,3 +398,49 @@ def test_the_readme_has_no_stale_target_or_emulator_commands():
                  "setup-android --emulator", "DelegateDoctor_ARM64",
                  "system-images;android-35"):
         assert gone not in text, f"README still shows {gone}"
+
+
+# --- emulator fallback: best-effort, never provisioned ------------------------
+
+def test_no_provisioning_code_reappeared():
+    """The fallback is *use*, not *manage*. None of this may come back."""
+    import pathlib
+
+    root = pathlib.Path(android_setup.__file__).parent
+    for path in root.rglob("*.py"):
+        if "__pycache__" in str(path):
+            continue
+        source = path.read_text()
+        for gone in ("DelegateDoctor_ARM64", "avdmanager create", "create_avd",
+                     "launch_emulator_process", "start_delegate_doctor_emulator",
+                     "system-images;android-35", "wait_for_boot"):
+            assert gone not in source, f"{path.name} reintroduced {gone}"
+
+
+def test_an_emulator_result_is_labelled_in_structured_output():
+    """results.json must carry the distinction, not leave it to be inferred."""
+    from delegate_doctor import result as result_module
+
+    for is_emulator, description in (
+            (True, "Arm64 Android emulator - sdk_gphone64_arm64 (arm64-v8a, Android 15)"),
+            (False, "Arm64 Android device - RMX2030 (arm64-v8a, Android 10)")):
+        outcome = result_module.OptimizationResult(
+            status=result_module.ANALYSIS_COMPLETE, model_name="m")
+        outcome.device_description = description
+        outcome.device_is_emulator = is_emulator
+        payload = outcome.to_dict()
+        assert payload["device_is_emulator"] is is_emulator
+        assert "emulator-" not in (payload["device"] or ""), \
+            "serial leaked into result.json"
+
+
+def test_the_device_identity_never_carries_a_serial():
+    from delegate_doctor.device import DeviceInfo
+
+    info = DeviceInfo(serial="emulator-5554", model="sdk_gphone64_arm64",
+                      abi="arm64-v8a", android_release="15", sdk_level="35",
+                      hardware="ranchu")
+    assert info.is_emulator
+    for text in (info.describe(), info.short_description()):
+        assert "emulator-5554" not in text
+        assert "emulator" in text.lower(), "an emulator run must say so"

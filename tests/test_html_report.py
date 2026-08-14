@@ -266,7 +266,26 @@ def test_an_accepted_repair_shows_correctness():
 def test_the_target_is_named():
     text = visible_text(render(accepted_result()))
     assert "RMX2030" in text
-    assert "Measured on device" in text
+    assert "Measured on a physical Android device" in text
+
+
+def test_an_emulator_run_is_labelled_and_carries_the_caveat():
+    """report.html is the shared artifact; the caveat must travel with it."""
+    outcome = accepted_result()
+    outcome.device_is_emulator = True
+    outcome.device_description = "sdk_gphone64_arm64 · arm64-v8a · Android 15"
+    text = visible_text(render(outcome))
+    assert "Measured on an Android emulator" in text
+    assert "not representative of physical Android hardware" in text
+
+
+def test_a_shareable_report_never_carries_the_adb_serial():
+    outcome = accepted_result()
+    outcome.device_is_emulator = True
+    outcome.device_description = "sdk_gphone64_arm64 · arm64-v8a · Android 15"
+    page = render(outcome)
+    for serial in ("emulator-5554", "a65d7d8b"):
+        assert serial not in page
 
 
 

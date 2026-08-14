@@ -1,22 +1,27 @@
-"""Find the physical Arm64 Android phones attached to this machine.
+"""Find the Arm64 Android targets attached to this machine, and choose one.
 
-DelegateDoctor measures on a real phone, and only on a real phone. This module
-discovers every adb target, keeps the physical arm64-v8a ones, and picks one -
-by explicit `--device SERIAL`, automatically when there is exactly one, or by
-asking when there are several.
+Policy, in one place:
+
+    Physical arm64-v8a Android devices are the supported and validated
+    benchmark target. DelegateDoctor does not provision, manage or validate
+    emulator environments.
+
+    An already-running arm64-v8a emulator is a best-effort fallback. If one is
+    visible through adb and no physical phone is usable, DelegateDoctor runs
+    against it rather than refusing - with a warning, and with every shareable
+    artifact labelled as emulator evidence.
+
+So an emulator is *usable* but never *preferred*: a phone always wins, and the
+presence of an emulator never turns a single-phone run into a question.
 
 Two things matter more than convenience here:
 
-  * **The ABI is checked before anything is measured.** An x86_64 Android target
-    tells you nothing about Arm, so it is never offered as a performance target.
+  * **The ABI is checked before anything is measured.** An x86_64 Android
+    target tells you nothing about Arm, so it is never used - emulator or not.
 
   * **One serial is chosen once and carried everywhere.** Profiling, device
-    verification and the benchmark all receive it explicitly, so a second phone
-    appearing mid-run cannot split a before/after comparison across two devices.
-
-Emulators are detected only so they can be excluded with a clear message: an
-emulator's latency is a property of the host, and DelegateDoctor no longer
-presents it as Arm evidence.
+    verification and the benchmark all receive it explicitly, so a second
+    target appearing mid-run cannot split a before/after comparison.
 """
 
 from __future__ import annotations
@@ -48,12 +53,14 @@ class Target:
 
     @property
     def usable(self) -> bool:
-        """Can this target produce Arm64 phone performance evidence?
+        """Can DelegateDoctor run against this target at all?
 
-        Physical and arm64-v8a. An emulator is excluded even when its ABI is
-        right: its latency describes the host it runs on.
+        The ABI, and nothing else. An arm64-v8a emulator is usable - as a
+        best-effort fallback, never as validated evidence. Whether it is
+        *preferred* is `usable_targets`' job, and how its results are labelled
+        is the report's.
         """
-        return self.info.abi == REQUIRED_ABI and not self.is_emulator
+        return self.info.abi == REQUIRED_ABI
 
     @property
     def display_name(self) -> str:
@@ -65,7 +72,8 @@ class Target:
 
     @property
     def kind_label(self) -> str:
-        return "Physical Android Device"
+        return ("Arm64 Android emulator" if self.is_emulator
+                else "Physical Android device")
 
     def describe(self) -> str:
         """Two-line form used by the interactive chooser."""
@@ -74,7 +82,8 @@ class Target:
                 f"   {self.info.abi} · Android {self.info.android_release}")
 
     def short_description(self) -> str:
-        return f"{self.display_name} · {self.info.abi}"
+        kind = " (emulator)" if self.is_emulator else ""
+        return f"{self.display_name} · {self.info.abi}{kind}"
 
 
 def list_adb_serials() -> list:
@@ -202,8 +211,26 @@ def physical_device_status() -> PhysicalDeviceStatus:
 
 
 def usable_targets(targets: list) -> list:
-    """Only the physical arm64-v8a phones."""
-    return [target for target in targets if target.usable]
+    """Every arm64-v8a target, physical first.
+
+    Ordering is the whole preference mechanism: a phone outranks an emulator,
+    so a machine with both never has to be asked, and a non-interactive run
+    picking `usable[0]` picks the phone.
+    """
+    usable = [target for target in targets if target.usable]
+    return sorted(usable, key=lambda target: target.is_emulator)
+
+
+def physical_targets(targets: list) -> list:
+    return [target for target in usable_targets(targets) if not target.is_emulator]
+
+
+EMULATOR_FALLBACK_NOTE = (
+    "Note: emulator execution is not a validated DelegateDoctor benchmark "
+    "target.\n"
+    "Physical arm64-v8a Android hardware is recommended for performance "
+    "results."
+)
 
 
 def format_target_menu(targets: list) -> str:
@@ -227,6 +254,10 @@ def _no_target_message(all_targets: list) -> str:
             "  3. Accept the debugging authorization prompt when it appears\n"
             "\n"
             "Then run the same command again.\n"
+            "\n"
+            "An already-running arm64-v8a Android emulator can also be used as\n"
+            "a best-effort target. DelegateDoctor does not create or manage\n"
+            "one.\n"
         )
 
     listed = "\n".join(
@@ -244,8 +275,8 @@ def _no_target_message(all_targets: list) -> str:
         f"DelegateDoctor targets Arm64 only, and the runners in runners/ are\n"
         f"cross-compiled for {REQUIRED_ABI}.\n"
         f"\n"
-        f"An emulator is also never used: its latency describes the host it\n"
-        f"runs on, not an Arm phone.\n"
+        f"An {REQUIRED_ABI} emulator would be usable as a best-effort target,\n"
+        f"but an x86_64 one is not: its latency describes the host it runs on.\n"
         f"\n"
         f"Connect a physical {REQUIRED_ABI} Android phone."
     )
@@ -271,14 +302,19 @@ def select_target(
             if target.serial == serial:
                 if not target.usable:
                     raise DeviceError(
-                        f"ARM TARGET NOT FOUND\n"
+                        f"UNSUPPORTED ANDROID TARGET\n"
                         f"\n"
-                        f"{serial} is {target.info.abi or 'an unknown ABI'}, and "
-                        f"DelegateDoctor requires {REQUIRED_ABI}.\n"
+                        f"ABI                     "
+                        f"{target.info.abi or 'unknown'}\n"
+                        f"Required                {REQUIRED_ABI}\n"
                         f"\n"
-                        f"An x86_64 target cannot produce Arm performance evidence."
+                        f"An x86_64 target cannot produce Arm performance "
+                        f"evidence, so DelegateDoctor will not benchmark on it."
                     )
-                return target
+                # An explicitly requested target is never silently swapped for
+                # another - including when it is an emulator. It is used, and
+                # the warning says what that means.
+                return _announce_choice(target, announce)
         attached = ", ".join(t.serial for t in targets) or "none"
         raise DeviceError(
             f"ARM TARGET NOT FOUND\n"
@@ -292,27 +328,56 @@ def select_target(
     if not usable:
         raise DeviceError(_no_target_message(targets))
 
-    # --- exactly one: use it, but say which ---------------------------------
-    if len(usable) == 1:
-        chosen = usable[0]
-        announce(f"Target                  {chosen.short_description()}")
-        return chosen
+    physical = physical_targets(targets)
 
-    # --- several: ask, or fall back to a stated rule ------------------------
+    # --- exactly one phone: use it, whatever else is running ----------------
+    #
+    # A running emulator must not turn a one-phone machine into a question.
+    if len(physical) == 1:
+        return _announce_choice(physical[0], announce)
+
+    # --- no phone at all: fall back to an emulator, best-effort -------------
+    if not physical:
+        if len(usable) == 1:
+            return _announce_choice(usable[0], announce)
+        return _choose_among(usable, interactive, prompt, announce,
+                             "emulator")
+
+    # --- several phones: ask, or say to use --device ------------------------
+    return _choose_among(physical, interactive, prompt, announce, "phone")
+
+
+def _announce_choice(chosen: "Target", announce) -> "Target":
+    """Name the target, and warn if it is a best-effort emulator."""
+    announce(f"Android target          {chosen.display_name}")
+    announce(f"Type                    {chosen.kind_label}")
+    announce(f"ABI                     {chosen.info.abi}")
+    if chosen.is_emulator:
+        announce("")
+        announce(EMULATOR_FALLBACK_NOTE)
+    return chosen
+
+
+def _choose_among(candidates: list, interactive: bool, prompt, announce,
+                  noun: str) -> "Target":
+    """Several equally-ranked targets: ask, or explain how to disambiguate."""
     if not interactive:
-        chosen = usable[0]      # physical first, per usable_targets()
-        announce(f"Target                  {chosen.short_description()} "
-                 f"(first of {len(usable)}; use --device to choose)")
+        chosen = candidates[0]
+        announce(f"Android target          {chosen.display_name} "
+                 f"(first of {len(candidates)}; use --device to choose)")
+        if chosen.is_emulator:
+            announce("")
+            announce(EMULATOR_FALLBACK_NOTE)
         return chosen
 
-    announce(format_target_menu(usable))
+    announce(format_target_menu(candidates))
     while True:
         try:
-            answer = prompt(f"Select benchmark target [1]: ").strip()
+            answer = prompt(f"Select benchmark {noun} [1]: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise DeviceError("No target selected.")
         if not answer:
-            return usable[0]
-        if answer.isdigit() and 1 <= int(answer) <= len(usable):
-            return usable[int(answer) - 1]
-        announce(f"Enter a number between 1 and {len(usable)}.")
+            return _announce_choice(candidates[0], announce)
+        if answer.isdigit() and 1 <= int(answer) <= len(candidates):
+            return _announce_choice(candidates[int(answer) - 1], announce)
+        announce(f"Enter a number between 1 and {len(candidates)}.")

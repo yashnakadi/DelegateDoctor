@@ -482,8 +482,22 @@ def _target(outcome) -> str:
             '</div></section>'
         )
 
-    kind = "Measured on device"
-    caveat = ""
+    # An emulator says so, prominently. report.html is the artifact people
+    # share, and a latency figure that outlives its context must still carry
+    # the one caveat that changes how it should be read.
+    if outcome.device_is_emulator:
+        kind = "Measured on an Android emulator"
+        caveat = (
+            '<div class="note" style="margin-top:10px">'
+            '<strong>Performance measurements were collected on an Android '
+            'emulator.</strong> Emulator latency is not representative of '
+            'physical Android hardware. DelegateDoctor does not provision or '
+            'validate emulator environments; physical arm64-v8a hardware is '
+            'the supported benchmark target.</div>'
+        )
+    else:
+        kind = "Measured on a physical Android device"
+        caveat = ""
     return (
         '<section><h2>Target</h2><div class="card">'
         f'<div class="metric-value small mono">{esc(outcome.device_description)}</div>'

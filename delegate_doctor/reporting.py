@@ -115,6 +115,11 @@ def format_summary(outcome) -> str:
         row("Latency", f"{outcome.benchmark.before.p50_ms:.2f} -> "
                        f"{outcome.benchmark.after.p50_ms:.2f} ms")
         row("Speedup", f"{outcome.benchmark.p50_speedup:.2f}x")
+        if outcome.device_is_emulator:
+            # Said next to the number it qualifies, not in a footnote. An
+            # emulator latency read later without this line would be mistaken
+            # for phone performance.
+            row("Measured on", "Android emulator (not validated)")
 
     if outcome.host_verification is not None:
         device_text = ("" if outcome.device_verification is None
@@ -566,6 +571,10 @@ def build_results_json(
         "rules_applied": rules_applied,
         "model": model_name,
         "device": device_description,
+        # Explicit rather than left for a consumer to infer from the device
+        # string: a benchmark row that outlives its context must still say
+        # whether it came from a phone.
+        "device_is_emulator": "emulator" in (device_description or "").lower(),
         "verification_passed": (
             verification_result.passed and device_verification_result.passed
         ),

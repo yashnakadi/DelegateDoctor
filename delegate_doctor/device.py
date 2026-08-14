@@ -139,7 +139,12 @@ class DeviceInfo:
 
     @property
     def is_emulator(self) -> bool:
-        """Detected only so an emulator can be excluded as a benchmark target.
+        """Is this target an emulator?
+
+        Used for three things and no others: preferring a physical phone when
+        both are attached, warning that an emulator run is best-effort, and
+        labelling the resulting artifacts. DelegateDoctor never creates, boots
+        or provisions one.
 
         'ranchu' is the Android emulator's virtual platform; goldfish is the
         older name and still shows up on some images.
@@ -147,12 +152,23 @@ class DeviceInfo:
         return self.hardware in ("ranchu", "goldfish") or "sdk" in self.model.lower()
 
     def describe(self) -> str:
-        kind = "Arm64 Android device"
+        """Full target identity, as it appears in shareable artifacts.
+
+        An emulator says so. Its latency is a property of the host it runs on,
+        and a report that did not distinguish the two would let an emulator
+        number be read as a phone number later, when the context is gone.
+
+        Deliberately no serial: this string is written into report.html,
+        report.txt and results.json, which users share.
+        """
+        kind = ("Arm64 Android emulator" if self.is_emulator
+                else "Arm64 Android device")
         return f"{kind} - {self.model} ({self.abi}, Android {self.android_release})"
 
     def short_description(self) -> str:
         """Compact one-line form for the console header."""
-        return f"{self.model} · {self.abi} · Android {self.android_release}"
+        text = f"{self.model} · {self.abi} · Android {self.android_release}"
+        return f"{text} (emulator)" if self.is_emulator else text
 
 
 def run_adb(*args: str, check: bool = True, serial: str | None = None) -> str:

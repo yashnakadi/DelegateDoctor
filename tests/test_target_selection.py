@@ -1,9 +1,13 @@
-"""Choosing a phone: classification, rejection, and one serial throughout.
+"""Choosing a target: classification, preference, and one serial throughout.
 
-DelegateDoctor measures on a physical arm64-v8a Android phone and nothing else.
-An emulator is still *detected* - so it can be excluded with a clear message
-rather than silently benchmarked - but it is never a usable target, because its
-latency describes the host it runs on.
+The policy under test:
+
+    A physical arm64-v8a Android phone is the supported and validated target
+    and always wins. An already-running arm64-v8a emulator is a best-effort
+    fallback - usable when no phone is, never preferred, and always warned
+    about.
+
+An x86_64 target is refused either way: it says nothing about Arm.
 
 Offline. `adb` is mocked at the `run_adb` boundary, so nothing here touches a
 real device - which is also the point of several of the tests.
@@ -51,22 +55,31 @@ def test_a_physical_arm64_phone_is_usable():
     assert phone().usable
 
 
-def test_an_emulator_is_never_usable_even_when_its_abi_is_right():
-    """An arm64 emulator runs the right instructions on the wrong machine."""
+def test_an_arm64_emulator_is_usable_as_a_best_effort_target():
+    """Usable, but never preferred - see the preference tests below."""
     target = an_emulator()
     assert target.is_emulator
     assert target.info.abi == target_selection.REQUIRED_ABI
-    assert not target.usable
+    assert target.usable
+
+
+def test_an_x86_emulator_is_not_usable():
+    x86 = make_target(serial="e", model="sdk_gphone64_x86_64", abi="x86_64",
+                      hardware="ranchu")
+    assert not x86.usable
 
 
 def test_an_x86_phone_is_not_usable():
     assert not x86_phone().usable
 
 
-def test_usable_targets_keeps_only_phones():
+def test_usable_targets_puts_phones_first():
+    """Ordering is the whole preference mechanism."""
     targets = [an_emulator(), phone(), x86_phone()]
     usable = target_selection.usable_targets(targets)
-    assert [t.serial for t in usable] == ["RMX-123"]
+    assert [t.serial for t in usable] == ["RMX-123", "emulator-5554"]
+    assert [t.serial for t in target_selection.physical_targets(targets)] == \
+        ["RMX-123"]
 
 
 def test_the_short_description_names_the_phone_and_its_abi():
@@ -137,12 +150,66 @@ def test_non_interactive_selection_never_prompts():
     assert chosen.serial == "A"
 
 
-def test_an_emulator_is_never_selected_even_when_it_is_the_only_target():
+def test_an_emulator_alone_is_used_with_a_warning():
+    """Best-effort rather than a refusal, but the user is told."""
+    said = []
+    chosen = target_selection.select_target(targets=[an_emulator()],
+                                            announce=said.append)
+    assert chosen.is_emulator
+    text = "\n".join(said)
+    assert "Arm64 Android emulator" in text
+    assert "not a validated" in text
+
+
+def test_a_phone_wins_over_an_emulator_without_asking():
+    """A running emulator must not turn a one-phone machine into a question."""
+    chosen = target_selection.select_target(
+        targets=[an_emulator(), phone()], interactive=True,
+        prompt=lambda text: pytest.fail("asked despite an unambiguous phone"),
+        announce=lambda *a: None)
+    assert chosen.serial == "RMX-123"
+    assert not chosen.is_emulator
+
+
+def test_a_phone_run_carries_no_emulator_warning():
+    said = []
+    target_selection.select_target(targets=[phone()], announce=said.append)
+    assert "emulator" not in "\n".join(said).lower()
+
+
+def test_several_emulators_and_no_phone_require_a_choice():
+    said = []
+    chosen = target_selection.select_target(
+        targets=[an_emulator("emulator-5554"), an_emulator("emulator-5556")],
+        interactive=False, announce=said.append)
+    assert chosen.is_emulator
+    assert "--device" in "\n".join(said)
+
+
+def test_an_unauthorized_phone_does_not_block_a_usable_emulator():
+    """discover_targets drops non-`device` states, so only the emulator remains."""
+    chosen = target_selection.select_target(targets=[an_emulator()],
+                                            announce=lambda *a: None)
+    assert chosen.is_emulator
+
+
+def test_device_selects_an_emulator_by_serial_with_the_warning():
+    said = []
+    chosen = target_selection.select_target(
+        serial="emulator-5554", targets=[phone(), an_emulator()],
+        announce=said.append)
+    assert chosen.serial == "emulator-5554"
+    assert "not a validated" in "\n".join(said)
+
+
+def test_device_refuses_an_x86_emulator_by_serial():
+    x86 = make_target(serial="emulator-9", model="sdk_gphone64_x86_64",
+                      abi="x86_64", hardware="ranchu")
     with pytest.raises(DeviceError) as caught:
-        target_selection.select_target(targets=[an_emulator()],
+        target_selection.select_target(serial="emulator-9", targets=[x86],
                                        announce=lambda *a: None)
     message = str(caught.value)
-    assert "arm64-v8a" in message
+    assert "x86_64" in message and "arm64-v8a" in message
 
 
 def test_no_targets_at_all_explains_how_to_get_one():

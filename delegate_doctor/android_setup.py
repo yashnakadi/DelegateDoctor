@@ -797,7 +797,29 @@ def format_target_readiness() -> str:
         status = target_selection.physical_device_status()
     except Exception as error:                          # pragma: no cover
         return f"\n(Could not check for a device: {type(error).__name__})"
-    return format_physical_device_summary(status)
+
+    summary = format_physical_device_summary(status)
+    if status.ready:
+        return summary
+
+    # No phone. If an emulator is already running, say so - `optimize` will use
+    # it as a best-effort target. Setup neither created it nor validates it, so
+    # it is reported beside the verdict rather than as one.
+    try:
+        emulators = [target for target in target_selection.discover_targets()
+                     if target.usable and target.is_emulator]
+    except Exception:                                   # pragma: no cover
+        emulators = []
+    if emulators:
+        summary += (
+            f"\n\nArm64 emulator          RUNNING    "
+            f"{emulators[0].display_name}\n"
+            f"\n"
+            f"DelegateDoctor can run against it as a best-effort target. It is\n"
+            f"not a validated benchmark target, and setup neither created nor\n"
+            f"manages it."
+        )
+    return summary
 
 
 def format_physical_device_summary(status) -> str:

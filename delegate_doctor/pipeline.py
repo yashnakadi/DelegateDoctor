@@ -282,6 +282,7 @@ def _run_analysis(
         runners_dir, target_serial=target_serial, interactive=interactive)
     if device_info is not None:
         outcome.device_description = device_info.short_description()
+        outcome.device_is_emulator = device_info.is_emulator
 
     emit(reporting.format_header(
         model_name=model_spec.name,

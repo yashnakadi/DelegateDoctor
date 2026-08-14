@@ -227,7 +227,7 @@ install location for your platform. DelegateDoctor never installs an SDK itself.
 
 ```bash
 git clone <repository-url>
-cd delegate-doctor-repo
+cd DelegateDoctor
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -240,7 +240,7 @@ delegate-doctor setup-android
 
 ```powershell
 git clone <repository-url>
-cd delegate-doctor-repo
+cd DelegateDoctor
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -277,14 +277,6 @@ otherwise would report "no device" on a machine with a phone plugged in.
 Enable Developer options and USB debugging, connect over USB, and accept the
 authorization prompt when it appears. Setup then finishes with:
 
-```
-Arm64 device            PASS    RMX2030 · arm64-v8a
-
-Physical-device environment READY
-
-    delegate-doctor optimize model.py
-```
-
 If the phone is attached but not ready, setup says which it is —
 `UNAUTHORIZED` (accept the prompt on the phone) or `OFFLINE` (reconnect) —
 rather than reporting it as missing. If adb itself cannot be found, it says
@@ -297,17 +289,18 @@ missing phone is reported as the next step rather than as a failure.
 
 ## Run your first model
 
+Models with a large, repairable fallback:
+
+```bash
+delegate-doctor optimize examples/dd001_softmax/pspnet.py
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py
+```
+
 A model that is already fully delegated — nothing to repair, and the analysis
 still tells you so:
 
 ```bash
 delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py
-```
-
-A model with a large, repairable fallback:
-
-```bash
-delegate-doctor optimize examples/dd003_avgpool/inception_v3.py
 ```
 
 The first reports 100% runtime delegation and no repair required. The second
@@ -394,9 +387,14 @@ asks — or, in a `--non-interactive` run, takes the first and tells you to use
 delegate-doctor optimize model.py --device SERIAL
 ```
 
-Every report records the phone it measured on — model, ABI, Android version —
+Every report records the target it measured on — model, ABI, Android version —
 so a result can never be confused with one from a different device. The adb
 serial is not written into shareable reports.
+
+If no phone is connected but an `arm64-v8a` emulator is already running,
+DelegateDoctor uses it rather than refusing, warns that it is best-effort, and
+labels every artifact from that run as emulator evidence. It never creates,
+downloads or boots one.
 
 ---
 
@@ -609,7 +607,7 @@ The suite is fully offline: no Android device, no NDK, no network and no API key
 - **ExecuTorch + XNNPACK only.** This is the one deployment path DelegateDoctor understands. Other backends and other runtimes are out of scope.
 - **The repair catalog is small** — three rules. A model whose fallbacks are not among them gets analysis and an honest "no known repair", which is a real answer but not a faster model.
 - **A device is required to accept a repair.** Correctness and speed are both measured on the target, so without one you get static analysis only.
-- **A physical arm64-v8a phone is required.** There is no emulator path. Without a phone you get static analysis — export, lowering and delegation — but no profiling, no verification, no benchmark and therefore no accepted repair.
+- **A physical arm64-v8a phone is the supported target.** Physical `arm64-v8a` Android devices are DelegateDoctor's supported and validated benchmark target. If an already-running `arm64-v8a` Android emulator is the only usable ADB target, DelegateDoctor can run against it on a best-effort basis — but it does not provision or validate emulator environments, and emulator latency should not be treated as physical-device performance. Every measurement published in this README came from the physical phone. With no usable target at all you get static analysis — export, lowering and delegation — but no profiling, verification, benchmark or accepted repair.
 - **The published numbers are single runs on one older handset.** They show direction and magnitude on that device; another phone will differ, which is exactly why DelegateDoctor benchmarks on yours rather than quoting these.
 - **Device verification reads the first output tensor**, as fp32. A model with several outputs is still analyzed and benchmarked; its device verification is marked unsupported rather than guessed at.
 - **Python 3.12 only**, and ExecuTorch 1.4.0 exactly. Both bounds are enforced by the packaging, so a mismatch is a clear error rather than a subtly different environment.
