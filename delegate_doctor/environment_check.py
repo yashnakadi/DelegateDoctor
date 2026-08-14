@@ -383,7 +383,7 @@ def collect_diagnostics() -> dict:
         resolved_adb = device.resolve_adb()
         diagnostics["adb"] = (describe_path(resolved_adb) if resolved_adb
                               else "not found")
-        for tool in ("emulator", "sdkmanager", "avdmanager"):
+        for tool in ("sdkmanager",):
             path = environment.tool_path(tool)
             diagnostics[tool] = describe_path(path) if path else "not found"
         diagnostics["ndk"] = (describe_path(environment.ndk)

@@ -78,7 +78,6 @@ class BenchmarkResult:
     repetitions: int
     threads: int
     device_description: str
-    device_is_emulator: bool
     raw_before_ms: List[float] = field(default_factory=list)
     raw_after_ms: List[float] = field(default_factory=list)
 
@@ -91,7 +90,6 @@ class BenchmarkResult:
     def to_dict(self) -> dict:
         return {
             "device": self.device_description,
-            "device_is_emulator": self.device_is_emulator,
             "warmup_iterations_per_repetition": self.warmup_iterations,
             "measured_iterations_per_repetition": self.measured_iterations,
             "repetitions": self.repetitions,
@@ -229,7 +227,6 @@ def benchmark_before_after(
         repetitions=repetitions,
         threads=threads,
         device_description=device_info.describe(),
-        device_is_emulator=device_info.is_emulator,
         raw_before_ms=before_samples,
         raw_after_ms=after_samples,
     )

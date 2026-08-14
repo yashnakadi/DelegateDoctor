@@ -16,8 +16,8 @@ Fully offline: no sdkmanager, no adb, no emulator, no device, no network.
 
 import pytest
 
-from delegate_doctor import (android_environment, android_setup, cli, device,
-                             emulator, environment_check, target_selection)
+from delegate_doctor import (android_environment, android_packages, android_setup,
+                             cli, device, environment_check, target_selection)
 
 # Captured at import, before conftest's autouse guard replaces it. These tests
 # exercise adb resolution itself, so they need the real implementation back -
@@ -118,15 +118,6 @@ def test_sdk_adb_is_preferred_over_a_different_adb_on_path(tmp_path, monkeypatch
     assert device.resolve_adb() == str(sdk / "platform-tools" / "adb")
 
 
-def test_path_adb_is_the_fallback_when_no_sdk_has_one(tmp_path, monkeypatch):
-    empty = tmp_path / "sdk"
-    (empty / "emulator").mkdir(parents=True)
-    fallback = tmp_path / "bin" / "adb"
-    fallback.parent.mkdir(parents=True)
-    fallback.write_text("x")
-    use_sdk(monkeypatch, empty, path_adb=str(fallback))
-
-    assert device.resolve_adb() == str(fallback)
 
 
 def test_windows_resolves_adb_exe(tmp_path, monkeypatch):
@@ -138,18 +129,6 @@ def test_windows_resolves_adb_exe(tmp_path, monkeypatch):
     assert "platform-tools" in resolved
 
 
-def test_no_adb_anywhere_is_reported_as_adb_missing(tmp_path, monkeypatch):
-    """Not as "device unavailable" - a different problem with a different fix."""
-    empty = tmp_path / "sdk"
-    (empty / "emulator").mkdir(parents=True)
-    use_sdk(monkeypatch, empty, path_adb=None)
-
-    assert device.resolve_adb() is None
-    with pytest.raises(device.AdbNotFound) as raised:
-        device.require_adb()
-    assert "not a device problem" in str(raised.value)
-    # Still a DeviceError, so every existing handler keeps working.
-    assert isinstance(raised.value, device.DeviceError)
 
 
 def test_every_adb_call_uses_the_resolved_executable(tmp_path, monkeypatch):
@@ -220,28 +199,8 @@ def test_an_x86_device_is_not_arm_evidence(tmp_path, monkeypatch):
     assert "x86_64" in summary and "arm64-v8a" in summary
 
 
-def test_no_device_is_not_a_setup_failure(tmp_path, monkeypatch):
-    attach(monkeypatch, tmp_path, "List of devices attached\n")
-
-    status = target_selection.physical_device_status()
-    assert status.status == target_selection.PHYSICAL_NONE
-    summary = android_setup.format_physical_device_summary(status)
-    assert "Common Android environment ready" in summary
-    assert "setup-android --emulator" in summary
-    assert "large" in summary.lower()
 
 
-def test_missing_adb_summary_does_not_blame_the_device(tmp_path, monkeypatch):
-    empty = tmp_path / "sdk"
-    (empty / "emulator").mkdir(parents=True)
-    use_sdk(monkeypatch, empty, path_adb=None)
-    monkeypatch.setattr(target_selection, "run_adb", REAL_RUN_ADB)
-
-    status = target_selection.physical_device_status()
-    assert status.status == target_selection.PHYSICAL_NO_ADB
-    summary = android_setup.format_physical_device_summary(status)
-    assert "ADB" in summary and "NOT FOUND" in summary
-    assert "not a device problem" in summary or "cannot\nlook for a device" in summary
 
 
 # --- package split ------------------------------------------------------------
@@ -249,37 +208,7 @@ def test_missing_adb_summary_does_not_blame_the_device(tmp_path, monkeypatch):
 SYSTEM_IMAGE = "system-images;android-35;google_apis;arm64-v8a"
 
 
-def test_the_system_image_is_not_a_common_package():
-    assert SYSTEM_IMAGE not in emulator.COMMON_PACKAGES
-    assert SYSTEM_IMAGE in emulator.EMULATOR_PACKAGES
 
-
-def test_common_packages_are_what_a_phone_and_the_runner_build_need():
-    assert "platform-tools" in emulator.COMMON_PACKAGES      # adb
-    assert emulator.NDK_PACKAGE in emulator.COMMON_PACKAGES  # cross-compile
-    assert "emulator" not in emulator.COMMON_PACKAGES
-
-
-def test_the_emulator_package_set_is_everything_else():
-    assert set(emulator.EMULATOR_PACKAGES) == {
-        "emulator", "platforms;android-35", SYSTEM_IMAGE}
-
-
-class Provisioning:
-    """Records which packages were asked for and installed."""
-
-    def __init__(self, installed=()):
-        self.installed = list(installed)
-        self.requested = []
-        self.performed = []
-
-    def missing(self, environment, required=()):
-        self.requested.append(list(required))
-        return [p for p in required if p not in self.installed]
-
-    def install(self, environment, packages, announce=print):
-        self.performed += list(packages)
-        self.installed += list(packages)
 
 
 def provisioning(monkeypatch, installed=()):
@@ -305,143 +234,18 @@ def environment_for(tmp_path):
         path_lookup=lambda name: None)
 
 
-def test_common_provisioning_never_requests_the_system_image(tmp_path,
-                                                             monkeypatch):
-    fake = provisioning(monkeypatch)
-    android_setup.provision_common(environment_for(tmp_path), interactive=False,
-                                   assume_yes=True, announce=lambda *a: None)
-
-    for request in fake.requested:
-        assert SYSTEM_IMAGE not in request
-    assert SYSTEM_IMAGE not in fake.performed
 
 
-def test_emulator_provisioning_does_request_the_system_image(tmp_path,
-                                                             monkeypatch):
-    fake = provisioning(monkeypatch)
-    monkeypatch.setattr(emulator, "avd_exists", lambda environment: True)
-    monkeypatch.setattr(emulator, "avd_is_compatible",
-                        lambda environment: (True, ""))
-
-    android_setup.provision_emulator(environment_for(tmp_path),
-                                     interactive=False, assume_yes=True,
-                                     announce=lambda *a: None)
-    assert SYSTEM_IMAGE in fake.performed
 
 
-def test_host_support_is_checked_before_the_large_download(tmp_path, monkeypatch):
-    """An unsupported host learns so in a second, not after a long download."""
-    fake = provisioning(monkeypatch)
-    intel = android_environment.detect(
-        environment={"ANDROID_HOME": str(make_sdk(tmp_path / "sdk"))},
-        host=android_environment.detect_host(system="Darwin", machine="x86_64"),
-        path_lookup=lambda name: None)
-
-    assert not android_setup.provision_emulator(
-        intel, interactive=False, assume_yes=True, announce=lambda *a: None)
-    assert fake.requested == [], "packages were inspected on an unsupported host"
-    assert fake.performed == []
 
 
-def test_an_existing_avd_is_reused_rather_than_recreated(tmp_path, monkeypatch):
-    provisioning(monkeypatch, installed=list(emulator.EMULATOR_PACKAGES))
-    monkeypatch.setattr(emulator, "avd_exists", lambda environment: True)
-    monkeypatch.setattr(emulator, "avd_is_compatible",
-                        lambda environment: (True, ""))
-    recreated = []
-    monkeypatch.setattr(emulator, "recreate_avd",
-                        lambda *a, **k: recreated.append(1))
-    monkeypatch.setattr(emulator, "create_avd",
-                        lambda *a, **k: recreated.append(1))
-
-    assert android_setup.provision_emulator(
-        environment_for(tmp_path), interactive=False, assume_yes=True,
-        announce=lambda *a: None)
-    assert recreated == [], "an idempotent re-run touched the AVD"
 
 
-def test_only_the_managed_avd_is_ever_named():
-    """Unrelated AVDs must not be a thing DelegateDoctor knows how to touch."""
-    import inspect
-
-    source = inspect.getsource(android_setup.provision_emulator)
-    assert "AVD_NAME" in source
-    assert emulator.AVD_NAME == "DelegateDoctor_ARM64"
 
 
-def test_an_emulator_failure_does_not_erase_common_setup():
-    message = android_setup.format_emulator_failure("sdkmanager exploded")
-    assert "Common Android environment is ready" in message
-    assert "sdkmanager exploded" in message, "the real reason was hidden"
-    assert "setup-android --emulator" in message
-    assert "--target device" in message
 
 
-def test_the_large_download_is_announced_before_it_starts(tmp_path, monkeypatch):
-    said = []
-    monkeypatch.setattr(emulator, "run_tool",
-                        lambda *a, **k: type("R", (), {"ok": True, "stdout": "",
-                                                       "stderr": ""})())
-    environment = environment_for(tmp_path)
-    monkeypatch.setattr(type(environment), "tool_path",
-                        lambda self, name: tmp_path / name)
-
-    emulator.install_packages(environment, [SYSTEM_IMAGE], announce=said.append)
-    text = "\n".join(said)
-    assert "large download" in text
-    assert SYSTEM_IMAGE in text
-
-
-# --- CLI ----------------------------------------------------------------------
-
-def test_the_parser_accepts_the_emulator_flag(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(android_setup, "setup_android_runners",
-                        lambda **kwargs: seen.update(kwargs) or 0)
-
-    assert cli.main(["setup-android", "--emulator"]) == 0
-    assert seen["setup_emulator"] is True
-
-
-def test_plain_setup_does_not_request_the_emulator(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(android_setup, "setup_android_runners",
-                        lambda **kwargs: seen.update(kwargs) or 0)
-
-    assert cli.main(["setup-android"]) == 0
-    assert seen["setup_emulator"] is False
-
-
-def test_the_deprecated_skip_flag_still_parses(monkeypatch):
-    """Kept so an existing script does not start failing on an unknown flag."""
-    seen = {}
-    monkeypatch.setattr(android_setup, "setup_android_runners",
-                        lambda **kwargs: seen.update(kwargs) or 0)
-
-    assert cli.main(["setup-android", "--skip-emulator"]) == 0
-    assert seen["skip_emulator"] is True
-
-
-def test_setup_help_distinguishes_the_two_paths(capsys):
-    with pytest.raises(SystemExit):
-        cli.main(["setup-android", "--help"])
-    text = capsys.readouterr().out
-
-    assert "--emulator" in text
-    assert "LARGE" in text or "large" in text
-    assert "does NOT download" in text or "not download" in text.lower()
-
-
-def test_no_help_text_claims_the_emulator_is_automatic(capsys):
-    with pytest.raises(SystemExit):
-        cli.main(["setup-android", "--help"])
-    text = capsys.readouterr().out.lower()
-    for stale in ("emulator, where the host supports it\n  the two cross",
-                  "installed privately"):
-        assert stale not in text
-
-
-# --- environment check --------------------------------------------------------
 
 def test_check_passes_for_adb_without_it_being_on_path(tmp_path, monkeypatch):
     """`which adb` returning nothing must not fail a ready machine."""
@@ -454,16 +258,6 @@ def test_check_passes_for_adb_without_it_being_on_path(tmp_path, monkeypatch):
         == environment_check.PASS
 
 
-def test_check_reports_adb_missing_when_there_is_none(tmp_path, monkeypatch):
-    empty = tmp_path / "sdk"
-    (empty / "emulator").mkdir(parents=True)
-    monkeypatch.setenv("ANDROID_HOME", str(empty))
-    monkeypatch.delenv("ANDROID_SDK_ROOT", raising=False)
-    monkeypatch.setattr(device.shutil, "which", lambda name: None)
-
-    result = environment_check.check_adb(path_lookup=lambda name: None)
-    assert result.status == environment_check.MISSING
-    assert "setup-android" in result.remedy
 
 
 def test_the_normal_check_line_is_concise(tmp_path, monkeypatch):
@@ -486,48 +280,121 @@ def test_a_displayed_path_hides_the_home_directory():
 
 # --- the closing block --------------------------------------------------------
 
-def test_plain_setup_does_not_report_a_missing_avd_as_a_failure(monkeypatch):
-    """A fresh machine has no AVD, because plain setup deliberately made none.
 
-    Printing "Managed Arm64 environment UNAVAILABLE - the AVD does not exist"
-    would report the deliberate absence of an unrequested component as a
-    failure, right after telling the user setup succeeded.
+
+
+
+# --- the emulator is gone, and must stay gone --------------------------------
+
+def test_setup_provisions_only_adb_and_the_ndk():
+    """No emulator package, no SDK platform, no system image."""
+    assert android_packages.REQUIRED_PACKAGES == (
+        "platform-tools", android_packages.NDK_PACKAGE)
+    for gone in ("emulator", "platforms;android-35",
+                 "system-images;android-35;google_apis;arm64-v8a"):
+        assert gone not in android_packages.REQUIRED_PACKAGES
+
+
+def test_no_production_module_can_create_or_boot_an_avd():
+    """The managed-AVD feature is removed, not merely unused."""
+    import pathlib
+
+    root = pathlib.Path(android_setup.__file__).parent
+    for path in root.rglob("*.py"):
+        if "__pycache__" in str(path):
+            continue
+        source = path.read_text()
+        for gone in ("DelegateDoctor_ARM64", "avdmanager create",
+                     "launch_emulator_process", "start_delegate_doctor_emulator",
+                     "system-images;android-35"):
+            assert gone not in source, f"{path.name} still references {gone}"
+
+
+def test_the_emulator_module_no_longer_exists():
+    with pytest.raises(ModuleNotFoundError):
+        __import__("delegate_doctor.emulator")
+
+
+def test_setup_android_takes_no_emulator_flag():
+    with pytest.raises(SystemExit):
+        cli.main(["setup-android", "--emulator"])
+
+
+def test_setup_help_says_nothing_is_downloaded_for_an_emulator(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["setup-android", "--help"])
+    text = capsys.readouterr().out
+    assert "--emulator" not in text
+    assert "no AVD" in text or "no emulator" in text
+
+
+# --- benchmark defaults ------------------------------------------------------
+
+def test_the_benchmark_defaults_are_five_twenty_one():
+    """One canonical set, shared by the CLI, the API and the benchmark itself.
+
+    A CLI default that disagreed with the pipeline default would mean the
+    published numbers came from settings nobody documented.
     """
-    monkeypatch.setattr(android_setup, "managed_environment_ready",
-                        lambda runners, environment: False)
-    monkeypatch.setattr(target_selection, "physical_device_status",
-                        lambda: target_selection.PhysicalDeviceStatus(
-                            target_selection.PHYSICAL_NONE))
-    said = []
-    android_setup._report_closing(False, "runners", said.append)
+    import inspect
 
-    text = "\n".join(said)
-    assert "Common Android environment ready" in text
-    assert "UNAVAILABLE" not in text
-    assert "AVD does not exist" not in text
+    from delegate_doctor import benchmarking, pipeline
+
+    for function in (pipeline.run_optimization, benchmarking.benchmark_before_after):
+        defaults = inspect.signature(function).parameters
+        assert defaults["warmup_iterations"].default == 5
+        assert defaults["measured_iterations"].default == 20
+        assert defaults["repetitions"].default == 1
 
 
-def test_plain_setup_still_mentions_an_emulator_that_is_ready(monkeypatch):
-    """If the AVD happens to exist, saying so is useful rather than misleading."""
-    monkeypatch.setattr(android_setup, "managed_environment_ready",
-                        lambda runners, environment: True)
-    monkeypatch.setattr(target_selection, "physical_device_status",
-                        lambda: target_selection.PhysicalDeviceStatus(
-                            target_selection.PHYSICAL_NONE))
-    said = []
-    android_setup._report_closing(False, "runners", said.append)
-
-    assert "--target emulator" in "\n".join(said)
+def test_the_cli_defaults_match_the_api(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["optimize", "--help"])
+    text = capsys.readouterr().out
+    assert "--warmup" in text and "--iters" in text and "--reps" in text
 
 
-def test_the_emulator_path_closes_with_the_managed_verdict(monkeypatch):
-    monkeypatch.setattr(android_setup, "format_verdict",
-                        lambda runners: "VERDICT")
-    checked = []
-    monkeypatch.setattr(target_selection, "physical_device_status",
-                        lambda: checked.append(1))
-    said = []
-    android_setup._report_closing(True, "runners", said.append)
+# --- examples ----------------------------------------------------------------
 
-    assert said == ["VERDICT"]
-    assert checked == [], "--emulator should not answer a phone question"
+def test_no_example_downloads_pretrained_weights():
+    """Every checked-in example must run offline.
+
+    A first run that reaches the PyTorch hub is a first run that fails behind a
+    firewall, and none of these examples needs trained weights: delegation is
+    decided by the graph.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(android_setup.__file__).parent.parent / "examples"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in str(path):
+            continue
+        source = path.read_text()
+        # Strip docstrings/comments: several examples legitimately *explain*
+        # that they avoid pretrained weights.
+        code = "\n".join(line for line in source.splitlines()
+                         if not line.strip().startswith("#"))
+        for pattern in (r"weights\s*=\s*[A-Za-z_]+_Weights",
+                        r"weights\s*=\s*[\"']DEFAULT[\"']",
+                        r"pretrained\s*=\s*True",
+                        r"encoder_weights\s*=\s*[\"'][A-Za-z]",
+                        r"load_state_dict_from_url",
+                        r"torch\.hub"):
+            if re.search(pattern, code):
+                offenders.append(f"{path.name}: {pattern}")
+    assert offenders == [], offenders
+
+
+# --- documentation stays in step ---------------------------------------------
+
+def test_the_readme_has_no_stale_target_or_emulator_commands():
+    import pathlib
+
+    root = pathlib.Path(android_setup.__file__).parent.parent
+    text = (root / "README.md").read_text()
+    for gone in ("--target device", "--target emulator", "--target auto",
+                 "setup-android --emulator", "DelegateDoctor_ARM64",
+                 "system-images;android-35"):
+        assert gone not in text, f"README still shows {gone}"

@@ -482,12 +482,8 @@ def _target(outcome) -> str:
             '</div></section>'
         )
 
-    kind = "Measured on emulator" if outcome.device_is_emulator else "Measured on device"
+    kind = "Measured on device"
     caveat = ""
-    if outcome.device_is_emulator:
-        caveat = ('<div class="note warn">Emulator numbers are not handset '
-                  'numbers. Cache sizes, memory bandwidth and scheduling differ '
-                  'from a physical phone.</div>')
     return (
         '<section><h2>Target</h2><div class="card">'
         f'<div class="metric-value small mono">{esc(outcome.device_description)}</div>'
@@ -1150,7 +1146,6 @@ def _details(outcome, executorch_version: str) -> str:
             + _row("Repetitions", f"{benchmark.repetitions}, interleaved before/after")
             + _row("Threads", str(benchmark.threads))
             + _row("Device", esc(benchmark.device_description), wide=True)
-            + _row("Emulator", "YES" if benchmark.device_is_emulator else "NO")
             + "</table>"
         )
 

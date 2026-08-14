@@ -1,6 +1,6 @@
 """What Android tooling this machine actually has, as structured data.
 
-Everything here answers questions - it changes nothing. `emulator.py` and
+Everything here answers questions - it changes nothing. `android_packages.py` and
 `android_setup.py` do the provisioning; this module just looks, so the looking
 can be unit-tested without an Android SDK anywhere in sight.
 
@@ -8,10 +8,6 @@ The rule that shapes the whole file: **discover, never search.** Conventional
 environment variables and a short list of standard install locations are
 checked, and that is all. DelegateDoctor does not walk a user's filesystem
 hunting for an SDK, and does not read anything outside the SDK it finds.
-
-Host support is deliberately three-valued, because "an Arm emulator could
-theoretically run here" and "DelegateDoctor has measured on it" are different
-claims and only one of them belongs in a performance tool.
 """
 
 from __future__ import annotations
@@ -45,9 +41,6 @@ _ARCH_ALIASES = {
 _OS_ALIASES = {"darwin": OS_MACOS, "windows": OS_WINDOWS, "linux": OS_LINUX}
 
 # Emulator support, from strongest claim to weakest.
-SUPPORT_VALIDATED = "SUPPORTED"        # DelegateDoctor has measured on this
-SUPPORT_UNTESTED = "UNTESTED"          # plausible, never validated here
-SUPPORT_UNAVAILABLE = "UNAVAILABLE"    # cannot give a meaningful Arm emulator
 
 
 @dataclass(frozen=True)
@@ -95,46 +88,6 @@ def detect_host(system: str = None, machine: str = None) -> HostPlatform:
     )
 
 
-def emulator_support(host: HostPlatform) -> tuple:
-    """Can this host give a *meaningful Arm64* Android emulator? (status, reason)
-
-    An Android emulator only runs Arm64 code at usable speed when the host is
-    itself Arm64 - otherwise it is emulating one instruction set on another,
-    and any latency it reports is a property of the emulation, not of Arm.
-
-    So an x86_64 host is told UNAVAILABLE rather than being handed an x86_64
-    image: DelegateDoctor measures Arm, and an x86 number presented as an Arm
-    number would be worse than no number at all.
-    """
-    if host.os_name == OS_MACOS and host.architecture == ARCH_ARM64:
-        return SUPPORT_VALIDATED, (
-            "Apple Silicon runs arm64-v8a system images natively. This is the "
-            "configuration DelegateDoctor's emulator evidence was measured on."
-        )
-
-    if host.architecture == ARCH_ARM64 and host.os_name in (OS_LINUX, OS_WINDOWS):
-        return SUPPORT_UNTESTED, (
-            f"{host.os_name} on arm64 could in principle run an arm64-v8a "
-            f"system image natively, but DelegateDoctor has never been "
-            f"validated on it. Treat any emulator result from this host as "
-            f"unverified, and prefer a physical device."
-        )
-
-    if host.architecture == ARCH_X86_64:
-        return SUPPORT_UNAVAILABLE, (
-            f"This host is {host.architecture}. An arm64-v8a system image "
-            f"would have to be emulated instruction by instruction, and its "
-            f"latency would measure the emulation rather than Arm.\n"
-            f"\n"
-            f"DelegateDoctor will not provision an x86_64 emulator and call it "
-            f"an Arm target. Connect a physical arm64-v8a Android device."
-        )
-
-    return SUPPORT_UNAVAILABLE, (
-        f"Unrecognised host ({host.raw_system} {host.raw_machine}). "
-        f"Connect a physical arm64-v8a Android device."
-    )
-
 
 # --- SDK and tools ----------------------------------------------------------
 
@@ -152,12 +105,10 @@ DEFAULT_SDK_LOCATIONS = (
 )
 
 # Tool name -> (subdirectory inside the SDK, POSIX name, Windows name).
-# sdkmanager and avdmanager ship as .bat files on Windows, not .exe.
+# sdkmanager ships as a .bat file on Windows, not .exe.
 TOOL_LAYOUT = {
     "adb": ("platform-tools", "adb", "adb.exe"),
-    "emulator": ("emulator", "emulator", "emulator.exe"),
     "sdkmanager": ("cmdline-tools", "sdkmanager", "sdkmanager.bat"),
-    "avdmanager": ("cmdline-tools", "avdmanager", "avdmanager.bat"),
 }
 
 
@@ -192,9 +143,8 @@ def is_usable_sdk(path: Path) -> bool:
     path = Path(path)
     if not path.is_dir():
         return False
-    if (path / "platform-tools").is_dir() or (path / "cmdline-tools").is_dir():
-        return True
-    return (path / "emulator").is_dir()
+    return ((path / "platform-tools").is_dir()
+            or (path / "cmdline-tools").is_dir())
 
 
 def find_sdk_root(environment: dict = None, home: Path = None) -> Optional[Path]:
@@ -363,22 +313,8 @@ class AndroidEnvironment:
 
     @property
     def has_command_line_tools(self) -> bool:
-        return self.tool("sdkmanager").found and self.tool("avdmanager").found
-
-    @property
-    def can_manage_emulator(self) -> bool:
-        """Enough tooling present to create and start an AVD."""
-        return (self.has_command_line_tools
-                and self.tool("emulator").found
-                and self.tool("adb").found)
-
-    @property
-    def emulator_support(self) -> str:
-        return emulator_support(self.host)[0]
-
-    @property
-    def emulator_support_reason(self) -> str:
-        return emulator_support(self.host)[1]
+        # sdkmanager only: avdmanager existed for the managed AVD, which is gone.
+        return self.tool("sdkmanager").found
 
 
 def detect(environment: dict = None, host: HostPlatform = None,
@@ -408,7 +344,7 @@ def _optional_path(value) -> Optional[Path]:
 COMMAND_LINE_TOOLS_MISSING_MESSAGE = (
     "Android SDK found, but Android command-line tools are missing.\n"
     "\n"
-    "DelegateDoctor uses Google's own sdkmanager and avdmanager to inspect and\n"
+    "DelegateDoctor uses Google's own sdkmanager to inspect and\n"
     "install Android packages. It does not download or bundle them itself.\n"
     "\n"
     "Install the Android SDK Command-line Tools - through Android Studio's SDK\n"

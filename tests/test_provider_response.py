@@ -154,7 +154,8 @@ def test_extraction_lives_in_exactly_one_place():
 
 def test_diagnostics_describe_the_response_without_quoting_it():
     """Cases 15/16: no key, no prompt, no model output."""
-    secret = "sk-super-secret-value"
+    # Assembled, not a literal - see the note in test_secret_boundary.py.
+    secret = "sk-" + "super-secret-value"
     response = Response(Choice(Message(content="PRIVATE MODEL GRAPH CONTENT")),
                         usage=Usage())
     diagnostics = provider_response.describe_response(response)

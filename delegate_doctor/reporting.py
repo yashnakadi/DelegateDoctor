@@ -533,8 +533,6 @@ def format_benchmark(benchmark_result) -> str:
         f"\n"
         f"{benchmark_result.p50_speedup:.2f}x speedup · {reduction:.1f}% lower p50\n"
     )
-    if benchmark_result.device_is_emulator:
-        text += "NOTE: Arm64 emulator, not a handset - treat the multiplier as provisional.\n"
     return text
 
 

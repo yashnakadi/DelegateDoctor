@@ -100,9 +100,7 @@ def run_optimize(target: str, open_report: bool = True,
         pipeline_options["runners_dir"] = runners_dir
         # Offered after the model is known to exist, so a typo fails on the
         # typo rather than on an Android environment the user never asked about.
-        ensure_target_available(
-            pipeline_options.get("target_preference", "auto"),
-            interactive, runners_dir)
+        ensure_target_available(interactive, runners_dir)
 
     pipeline_options.setdefault("interactive", interactive)
     # Two capabilities, two switches. `--allow-ai-source` authorizes sending
@@ -346,26 +344,23 @@ def _no_ai_permission_message(reason: str) -> str:
 # --- setup on demand -----------------------------------------------------------
 
 
-def ensure_target_available(preference: str, interactive: bool,
-                            runners_dir: str, announce=print,
-                            prompt=input) -> bool:
-    """Offer to provision the managed Arm64 environment when it is missing.
+def ensure_target_available(interactive: bool, runners_dir: str,
+                            announce=print, prompt=input) -> bool:
+    """Offer to build the Arm64 runners when they are missing.
 
-    Onboarding should not require reading about `setup-android` first. When a
-    user asks for the emulator and it is not there, the useful response is to
-    offer to build it and then carry on with what they actually typed.
+    Onboarding should not require reading about `setup-android` first: if the
+    runners are not there, the useful response is to offer to build them and
+    then carry on with what the user actually typed.
 
     The provisioning itself is `android_setup`'s - this only decides whether to
     ask, so there is one setup implementation and not two.
     """
-    if preference != target_selection.PREFERENCE_EMULATOR:
-        return True
-    if android_setup.managed_environment_ready(Path(runners_dir)):
+    if android_setup.runners_already_installed(Path(runners_dir)):
         return True
 
-    announce("\nManaged Arm64 Android environment is not ready.")
+    announce("\nThe Arm64 ExecuTorch runners are not built yet.")
     if not interactive:
-        announce("Run `delegate-doctor setup-android` to provision it.")
+        announce("Run `delegate-doctor setup-android` to build them.")
         return False
 
     try:
@@ -425,8 +420,7 @@ def main(argv: Optional[list] = None) -> int:
             "every portable hotspot worth repairing.\n"
             "\n"
             "  delegate-doctor optimize model.py\n"
-            "  delegate-doctor optimize model.py --target emulator\n"
-            "  delegate-doctor optimize model.py --target device --device SERIAL\n"
+            "  delegate-doctor optimize model.py --device SERIAL\n"
             "\n"
             "A bare filename is also looked for in models/, the local workspace "
             "beside this repository.\n"
@@ -464,11 +458,6 @@ def main(argv: Optional[list] = None) -> int:
                           help="CPU threads used on the device")
     optimize.add_argument("--profile-iters", type=int, default=20,
                           help="iterations traced when profiling")
-    # dest is explicit: the positional model argument is already called
-    # "target", and argparse would otherwise let --target overwrite it.
-    optimize.add_argument("--target", default="auto", dest="target_kind",
-                          choices=target_selection.PREFERENCES,
-                          help="which kind of Arm target to measure on")
     optimize.add_argument("--device", default=None, metavar="SERIAL",
                           dest="target_serial",
                           help="measure on this exact adb serial")
@@ -531,32 +520,23 @@ def main(argv: Optional[list] = None) -> int:
         "setup-android",
         help="provision the Arm64 Android environment and build the runners",
         description=(
-            "Prepare what DelegateDoctor needs to measure on Arm64.\n"
-            "\n"
-            "Plain setup targets a PHYSICAL arm64-v8a phone, and is the fast\n"
-            "path:\n"
+            "Prepare what DelegateDoctor needs to measure on a physical\n"
+            "arm64-v8a Android phone:\n"
             "\n"
             "  the Android SDK Android Studio installed - discovered through\n"
             "  ANDROID_HOME, ANDROID_SDK_ROOT or the standard location for\n"
             "  this platform. DelegateDoctor never installs an SDK itself.\n"
             "  platform-tools (adb) and the pinned NDK\n"
             "  the two cross-compiled ExecuTorch runners\n"
-            "  a check for an attached arm64-v8a device\n"
+            "  a check for an attached arm64-v8a phone\n"
             "\n"
-            "It does NOT download the Arm64 emulator system image.\n"
+            "Nothing else is downloaded: there is no emulator, no AVD and\n"
+            "no Android system image, because DelegateDoctor measures on a\n"
+            "real phone.\n"
             "\n"
-            "--emulator additionally provisions the managed emulator:\n"
-            "\n"
-            "  the emulator package and the pinned platform\n"
-            "  system-images;android-35;google_apis;arm64-v8a - a LARGE\n"
-            "  download, typically several gigabytes and several minutes\n"
-            "  the DelegateDoctor_ARM64 AVD, where the host supports it\n"
-            "\n"
-            "Use it when you have no Arm64 phone to hand.\n"
-            "\n"
-            "Your own AVDs, Android Studio settings and shell profile are "
-            "never touched. Running this first is optional - `optimize` can "
-            "offer to do it when it finds the environment missing."
+            "Your Android Studio settings and shell profile are never "
+            "touched. Running this first is optional - `optimize` can offer "
+            "to do it when it finds the runners missing."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -570,14 +550,6 @@ def main(argv: Optional[list] = None) -> int:
                        help="never prompt; report what is missing instead")
     setup.add_argument("--yes", action="store_true",
                        help="install missing Android components without asking")
-    setup.add_argument("--emulator", action="store_true", dest="setup_emulator",
-                       help="also provision the managed Arm64 emulator. This "
-                            "downloads a large Android system image "
-                            "(system-images;android-35;google_apis;arm64-v8a)")
-    setup.add_argument("--skip-emulator", action="store_true",
-                       help="deprecated: the emulator is now opt-in via "
-                            "--emulator, so this is the default. Kept so "
-                            "existing scripts keep working")
 
     args = parser.parse_args(argv)
 
@@ -601,8 +573,6 @@ def main(argv: Optional[list] = None) -> int:
                 parallel_jobs=args.jobs,
                 interactive=not args.non_interactive,
                 assume_yes=args.yes,
-                setup_emulator=args.setup_emulator,
-                skip_emulator=args.skip_emulator,
             )
         except android_setup.SetupError as error:
             print(f"\n{error}", file=sys.stderr)
@@ -618,7 +588,6 @@ def main(argv: Optional[list] = None) -> int:
                 allow_ai_source=args.allow_ai_source,
                 ai_repair=args.ai_repair,
                 verbose=args.verbose,
-                target_preference=args.target_kind,
                 target_serial=args.target_serial,
                 runners_dir=args.runners_dir,
                 artifacts_dir=args.artifacts_dir,

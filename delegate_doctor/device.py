@@ -139,24 +139,20 @@ class DeviceInfo:
 
     @property
     def is_emulator(self) -> bool:
-        # 'ranchu' is the Android emulator's virtual platform. Goldfish is the
-        # older name and still shows up on some images.
+        """Detected only so an emulator can be excluded as a benchmark target.
+
+        'ranchu' is the Android emulator's virtual platform; goldfish is the
+        older name and still shows up on some images.
+        """
         return self.hardware in ("ranchu", "goldfish") or "sdk" in self.model.lower()
 
     def describe(self) -> str:
-        kind = "Arm64 Android emulator" if self.is_emulator else "Arm64 Android device"
+        kind = "Arm64 Android device"
         return f"{kind} - {self.model} ({self.abi}, Android {self.android_release})"
 
     def short_description(self) -> str:
-        """Compact one-line form for the console header.
-
-        Emulators stay labelled: their numbers are not handset numbers, and that
-        distinction must survive being made concise.
-        """
-        text = f"{self.model} · {self.abi} · Android {self.android_release}"
-        if self.is_emulator:
-            text += " (emulator)"
-        return text
+        """Compact one-line form for the console header."""
+        return f"{self.model} · {self.abi} · Android {self.android_release}"
 
 
 def run_adb(*args: str, check: bool = True, serial: str | None = None) -> str:
@@ -192,18 +188,14 @@ def require_device() -> DeviceInfo:
 
     if not connected:
         raise DeviceError(
-            "No Arm64 Android target is attached.\n"
+            "NO ANDROID PHONE FOUND\n"
             "\n"
-            "DelegateDoctor runs the model on a real Arm64 target, so it needs a device\n"
-            "or emulator visible to adb. Check with:\n"
+            "DelegateDoctor runs the model on a physical arm64-v8a Android\n"
+            "phone, so it needs one attached and authorized.\n"
             "\n"
-            "    adb devices\n"
-            "\n"
-            "A physical Arm64 phone is preferred. To start an emulator instead:\n"
-            "\n"
-            "    $ANDROID_HOME/emulator/emulator -avd <your-arm64-avd> -no-window -no-audio -gpu off\n"
-            "\n"
-            "See the 'Connect an Arm64 Android target' section of the README."
+            "  1. Enable Developer options and USB debugging on the phone\n"
+            "  2. Connect it over USB\n"
+            "  3. Accept the debugging authorization prompt when it appears\n"
         )
     if len(connected) > 1:
         raise DeviceError(
@@ -233,8 +225,9 @@ def require_device() -> DeviceInfo:
             f"    required: arm64-v8a\n"
             f"\n"
             f"DelegateDoctor targets Arm64 only, and the runners in runners/ are\n"
-            f"cross-compiled for arm64-v8a. An x86_64 emulator image will not work;\n"
-            f"use an arm64-v8a system image or a physical Arm64 phone."
+            f"cross-compiled for arm64-v8a.\n"
+            f"\n"
+            f"Connect a physical arm64-v8a Android phone."
         )
     return info
 

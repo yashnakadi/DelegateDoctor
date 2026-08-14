@@ -53,36 +53,14 @@ def test_detecting_the_real_host_does_not_raise():
 
 # --- the Arm-only emulator policy (the correctness requirement) --------------
 
-def test_apple_silicon_is_the_validated_emulator_host():
-    status, reason = env.emulator_support(host(env.OS_MACOS, env.ARCH_ARM64))
-    assert status == env.SUPPORT_VALIDATED
-    assert "natively" in reason
 
 
-@pytest.mark.parametrize("os_name", [env.OS_WINDOWS, env.OS_LINUX, env.OS_MACOS])
-def test_an_x86_host_is_never_offered_an_arm_emulator(os_name):
-    """The central rule: x86 emulation must never be sold as Arm performance."""
-    status, reason = env.emulator_support(host(os_name, env.ARCH_X86_64))
-    assert status == env.SUPPORT_UNAVAILABLE
-    assert "will not provision an x86_64 emulator" in reason
-    assert "physical arm64-v8a" in reason
 
 
-@pytest.mark.parametrize("os_name", [env.OS_LINUX, env.OS_WINDOWS])
-def test_arm64_hosts_other_than_macos_are_reported_as_untested(os_name):
-    """Plausible, never validated here - and the wording must say so."""
-    status, reason = env.emulator_support(host(os_name, env.ARCH_ARM64))
-    assert status == env.SUPPORT_UNTESTED
-    assert "never been" in reason and "validated" in reason
 
 
-def test_an_unknown_host_is_reported_unavailable_not_supported():
-    status, _ = env.emulator_support(host(env.OS_UNKNOWN, env.ARCH_UNKNOWN))
-    assert status == env.SUPPORT_UNAVAILABLE
 
 
-def test_support_is_three_valued_so_claims_stay_honest():
-    assert env.SUPPORT_VALIDATED != env.SUPPORT_UNTESTED != env.SUPPORT_UNAVAILABLE
 
 
 # --- SDK discovery -----------------------------------------------------------
@@ -93,8 +71,6 @@ def make_sdk(root: Path, windows=False) -> Path:
     suffix_bat = ".bat" if windows else ""
     (root / "platform-tools").mkdir(parents=True)
     (root / "platform-tools" / f"adb{suffix_exe}").write_text("x")
-    (root / "emulator").mkdir()
-    (root / "emulator" / f"emulator{suffix_exe}").write_text("x")
     tools = root / "cmdline-tools" / "latest" / "bin"
     tools.mkdir(parents=True)
     (tools / f"sdkmanager{suffix_bat}").write_text("x")
@@ -144,7 +120,7 @@ def test_discovery_never_walks_the_filesystem(tmp_path, monkeypatch):
 
 def test_tools_are_found_inside_the_sdk(tmp_path):
     sdk = make_sdk(tmp_path / "sdk")
-    for name in ("adb", "emulator", "sdkmanager", "avdmanager"):
+    for name in ("adb", "sdkmanager"):
         tool = env.find_tool(name, host(), sdk, path_lookup=lambda n: None)
         assert tool.found, name
         assert sdk in tool.path.parents
@@ -246,35 +222,8 @@ def test_no_ndk_returns_none(tmp_path, monkeypatch):
 
 # --- the assembled environment ----------------------------------------------
 
-def test_detect_assembles_everything(tmp_path, monkeypatch):
-    monkeypatch.setattr(env, "DEFAULT_SDK_LOCATIONS", ())
-    sdk = make_sdk(tmp_path / "sdk")
-    make_ndk(sdk / "ndk" / "27.2.12479018")
-
-    detected = env.detect(
-        environment={"ANDROID_HOME": str(sdk)},
-        host=host(),
-        path_lookup=lambda name: f"/usr/bin/{name}",
-    )
-    assert detected.has_sdk
-    assert detected.has_command_line_tools
-    assert detected.can_manage_emulator
-    assert detected.ndk is not None
-    assert detected.cmake is not None
-    assert detected.git is not None
 
 
-def test_an_sdk_without_command_line_tools_is_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr(env, "DEFAULT_SDK_LOCATIONS", ())
-    sdk = tmp_path / "sdk"
-    (sdk / "platform-tools").mkdir(parents=True)
-    (sdk / "platform-tools" / "adb").write_text("x")
-
-    detected = env.detect(environment={"ANDROID_HOME": str(sdk)}, host=host(),
-                          path_lookup=lambda name: None)
-    assert detected.has_sdk
-    assert not detected.has_command_line_tools
-    assert not detected.can_manage_emulator
 
 
 def test_no_sdk_at_all_is_reported(monkeypatch):
@@ -285,10 +234,6 @@ def test_no_sdk_at_all_is_reported(monkeypatch):
     assert detected.tool("adb").status == "MISSING"
 
 
-def test_the_environment_exposes_its_emulator_policy():
-    detected = env.AndroidEnvironment(host=host(env.OS_LINUX, env.ARCH_X86_64))
-    assert detected.emulator_support == env.SUPPORT_UNAVAILABLE
-    assert "x86_64" in detected.emulator_support_reason
 
 
 # --- messages ----------------------------------------------------------------

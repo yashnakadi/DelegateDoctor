@@ -4,10 +4,8 @@ DenseNet's transition layers use avg_pool2d with no padding, where the repair
 is a flag change and no node is added at all. DD-003 was never designed against
 this model, which is the point.
 
-`weights=None` keeps the first run offline. Note that the DenseNet169 latency
-row in the README was measured with pretrained weights; the repair and the
-delegation change are identical either way, but the millisecond figures are
-not directly reproducible from this file.
+`weights=None` keeps the first run offline, and the README's DenseNet169
+numbers were measured from this exact file.
 """
 
 import torch

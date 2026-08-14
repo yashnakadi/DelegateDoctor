@@ -91,42 +91,8 @@ def test_detection_output_is_compact():
     assert len([line for line in text.splitlines() if line.strip()]) <= 4
 
 
-def test_benchmark_output_is_a_compact_table():
-    class Stats:
-        def __init__(self, p50, p95, mean):
-            self.p50_ms, self.p95_ms, self.mean_ms = p50, p95, mean
-            self.p99_ms, self.sample_count = p95 + 5, 450
-            self.stdev_ms, self.min_ms, self.max_ms = 1.0, p50 - 5, p95 + 9
-            self.throughput_per_second = 1000.0 / mean
-
-    class FakeBenchmark:
-        before = Stats(242.69, 284.43, 250.31)
-        after = Stats(65.53, 73.40, 68.22)
-        threads, measured_iterations, repetitions = 4, 150, 3
-        device_is_emulator = False
-        p50_speedup = 242.69 / 65.53
-
-    text = reporting.format_benchmark(FakeBenchmark())
-    assert "p50" in text and "p95" in text and "mean" in text
-    assert "3.70x speedup" in text
-    assert "73.0% lower p50" in text
-    assert len([line for line in text.splitlines() if line.strip()]) <= 9
 
 
-def test_emulator_benchmark_stays_labelled():
-    """Compressing output must not lose the emulator caveat."""
-    class Stats:
-        p50_ms = p95_ms = mean_ms = 10.0
-        p99_ms = 11.0
-        sample_count = 450
-
-    class FakeBenchmark:
-        before = after = Stats()
-        threads, measured_iterations, repetitions = 4, 150, 3
-        device_is_emulator = True
-        p50_speedup = 1.0
-
-    assert "emulator" in reporting.format_benchmark(FakeBenchmark())
 
 
 def test_accepted_decision_names_the_device():

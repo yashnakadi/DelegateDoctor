@@ -7,23 +7,23 @@ DelegateDoctor exports your model, lowers it with the XNNPACK partitioner, runs 
 > **Not all fallbacks are equal. Optimize runtime, not operator counts.**
 
 ```bash
-delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulator
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py
 ```
 
 ```
-[1] avg_pool2d.out          60.8%
+[1] avg_pool2d.out          46.7%
     DD-003 found
     Applying to 9 matching sites...
     Host correctness       PASS
     Device correctness     PASS
-    p50                    96.68 -> 36.49 ms
+    p50                    825.18 -> 424.19 ms
     Result                 ACCEPTED
 
-Runtime delegation      39.1% -> 99.8%
-Speedup                 2.65x
+Runtime delegation      53.3% -> 100.0%
+Speedup                 1.95x
 ```
 
-Every number above was measured on an Arm64 Android target, not estimated. Inference runs locally on the device, and the default workflow contacts no AI provider.
+Every number above was measured on a physical Arm64 Android phone, not estimated. Inference runs locally on the device, and the default workflow contacts no AI provider.
 
 ---
 
@@ -38,9 +38,9 @@ Inception V3, measured:
 | | before repair |
 | --- | --- |
 | Operators delegated | **97.1%** (9 of 314 fell back) |
-| Runtime inside XNNPACK | **39.1%** |
+| Runtime inside XNNPACK | **53.3%** |
 
-Nine `avg_pool2d` nodes out of 314 operators — under 3% of the graph — accounted for **60.8% of measured inference time**. A tool reporting operator counts would have called this model well optimized and moved on.
+Nine `avg_pool2d` nodes out of 314 operators — under 3% of the graph — accounted for **46.7% of measured inference time**. A tool reporting operator counts would have called this model well optimized and moved on.
 
 This happens because operator count says nothing about cost. One fallback on a large tensor can outweigh hundreds of delegated operators, and each fallback also splits the delegate into separate blobs, adding layout conversions at every boundary.
 
@@ -61,7 +61,7 @@ PyTorch model (nn.Module)
         v  to_edge_transform_and_lower + XNNPACK partitioner
    ExecuTorch .pte
         |
-        v  run on Arm64 Android, ETDump event trace
+        v  run on a physical Arm64 Android phone, ETDump event trace
    profile
         |
         v  rank portable fallbacks by measured runtime share
@@ -71,7 +71,7 @@ PyTorch model (nn.Module)
    candidate
         |
         +--> host correctness      vs the original program
-        +--> device correctness    vs the original, on the Arm target
+        +--> device correctness    vs the original, on the phone
         +--> backend fidelity      how well the backend tracks PyTorch
         +--> benchmark             p50, tracer-free runner, interleaved
               |
@@ -85,54 +85,112 @@ Repairs accumulate: after one is accepted the model is re-profiled, because remo
 
 ## Demonstrated results
 
-Three rules, validated across twelve model architectures. Emulator and physical-device measurements are never mixed.
+Every number below was measured on the same physical Android phone, by the same
+code revision, with the same settings. There are no emulator measurements and no
+estimates.
 
-### DD-001 — physical device (RMX2030)
+```
+Target      RMX2030 · arm64-v8a · Android 10 (SDK 29)
+Backend     ExecuTorch 1.4.0 + XNNPACK
+Benchmark   5 warmup + 20 measured iterations, 1 repetition, 4 threads
+Runner      executor_runner_bench (event tracer OFF)
+```
 
-One unchanged rule applied to six independent `segmentation_models_pytorch` architectures. All six matched the same pattern, were repaired by the same code with no architecture-specific branches, passed host and Android verification, and got faster on a physical phone.
+These are **single-run device measurements**. The settings are deliberately
+lightweight: the validation phone is an older handset and the suite covers a
+dozen architectures, so they favour covering the suite over per-model
+statistical depth. One repetition means one measured run — no median across
+runs is implied.
 
-Target: RMX2030, Snapdragon SDM665, arm64-v8a, Android 10. Tracer-free runner, 4 threads, 20 warmup + 150 measured x 3 reps.
+Every example uses random weights and needs no network. No experimental AI
+repair was used for any of it.
 
-| Architecture | Softmax runtime | Runtime delegation | p50 before | p50 after | Speedup |
+Full data: [`results/physical_phone_benchmarks.md`](results/physical_phone_benchmarks.md)
+
+### DD-001 — non-last-dimension softmax
+
+Seven examples, one unchanged rule, all accepted. Each detected exactly one site.
+
+| Architecture | softmax share | Runtime delegation | p50 before | p50 after | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| PSPNet | 38.0% | 61.9% → 99.4% | 242.69 ms | 65.53 ms | 3.703x |
-| Linknet | 42.0% | 58.0% → 100.0% | 267.09 ms | 111.82 ms | 2.389x |
-| DeepLabV3Plus | 38.6% | 61.4% → 100.0% | 286.29 ms | 180.38 ms | 1.587x |
-| FPN | 22.8% | 73.6% → 93.1% | 394.77 ms | 253.65 ms | 1.556x |
-| Unet | 20.8% | 75.1% → 94.0% | 459.61 ms | 338.10 ms | 1.359x |
-| UnetPlusPlus | 18.0% | 77.2% → 93.7% | 573.52 ms | 442.84 ms | 1.295x |
+| PSPNet | 46.8% | 53.0% → 99.6% | 224.57 ms | 73.26 ms | **3.07x** |
+| DeepLabV3+ | 40.9% | 59.1% → 100.0% | 376.65 ms | 132.67 ms | **2.84x** |
+| SmallNet (MNIST-shaped) | 4.5% | 95.4% → 100.0% | 4.63 ms | 2.42 ms | 1.91x |
+| Linknet | 41.7% | 58.3% → 100.0% | 258.99 ms | 163.40 ms | 1.58x |
+| FPN | 25.2% | 70.8% → 93.4% | 386.79 ms | 253.26 ms | 1.53x |
+| U-Net | 22.1% | 73.5% → 93.7% | 525.55 ms | 343.40 ms | 1.53x |
+| U-Net++ | 16.2% | 79.5% → 93.4% | 625.03 ms | 424.54 ms | 1.47x |
 
-Single runs, except PSPNet and Linknet, which were repeated three times: **median 3.794x** and **median 2.217x** respectively. PSPNet's spread across runs was wide (3.70–5.12x) — this is a phone under sustained load, so the median is the number to quote.
+Host and device correctness PASS throughout. Six are independent
+`segmentation_models_pytorch` architectures repaired by the same code with no
+architecture-specific branches.
 
-Operator-count delegation moved by 0.5–1.5 points across these six models while runtime-weighted delegation moved by 16–42 points. That gap is the entire thesis of this project.
+`SmallNet` is the useful counter-example: its softmax is only 4.5% of runtime
+and it still returned 1.91x, because removing the fallback also removed the
+delegate boundary it was forcing. Hotspot share screens candidates; it does not
+predict the win.
 
-Full record: [`results/dd001_segmentation_generalization.md`](results/dd001_segmentation_generalization.md)
+Detail: [`results/dd001_physical_validation.md`](results/dd001_physical_validation.md)
 
-### DD-003 — Arm64 Android emulator
+### DD-002 — redundant `aten.alias`
 
-The clearest illustration of runtime-weighted delegation. Measured on an Arm64 Android emulator (`sdk_gphone64_arm64`, arm64-v8a, Android 15) on an Apple Silicon host — **not a handset**.
+| | value |
+| --- | --- |
+| Model | timm GhostNet-100 |
+| Matching sites | 32 |
+| Hotspot (`alias_copy.out`) | 0.5% of runtime |
+| Runtime delegation | 99.5% → 100.0% |
+| Host correctness | PASS |
+| Device correctness | PASS |
+| p50 | 721.71 ms → **499.19 ms** |
+| Decision | **REPAIR ACCEPTED — 1.45x** |
 
-| Model | Sites repaired | Operator delegation | Runtime delegation | p50 | Speedup |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Inception V3 | 9 | 97.1% → 100.0% | **39.1% → 99.8%** | 96.68 → 36.49 ms | **2.65x** |
-| DenseNet121 | 3 | 98.4% → 99.1% | 88.3% → 99.8% | 22.92 → 19.81 ms | 1.16x |
-| DenseNet169 | 3 | 98.8% → 99.3% | 89.8% → 99.9% | 27.48 → 24.86 ms | 1.11x |
+Measured at `--reps 5` rather than the suite default of 1, and that detail is
+the interesting part. GhostNet's baseline latency is **bimodal** on this
+handset: individual samples span 43 ms to 827 ms within a single run, with a
+standard deviation a third of the median. The repaired graph is far tighter.
 
-The rewrite is bit-exact: maximum absolute difference against the original is **0.000e+00** on all three models in eager PyTorch, across a sweep of nine input shapes crossed with five kernel/stride/padding combinations.
+At one repetition the verdict flips with whichever mode the baseline happens to
+sample — eight single-repetition runs split four ACCEPTED, four rejected, while
+the repaired graph sat at 404–551 ms throughout. Two runs at five interleaved
+repetitions agree: 1.45x and 1.42x.
 
-DenseNet121 and DenseNet169 matter because DD-003 was never designed against them. They hit a different form of the same rule — zero padding, where the fix is a flag change and no node is added at all.
+The lesson is the one the tool is built on. A repair that looks like a win or a
+loss on one short run is neither until it is measured properly, which is why
+DelegateDoctor benchmarks on your device and why `--reps` exists. Full
+distribution and all ten runs:
+[`results/dd002_physical_validation.md`](results/dd002_physical_validation.md)
 
-Full record: [`results/dd003_avgpool_validation.md`](results/dd003_avgpool_validation.md)
+### DD-003 — `avg_pool2d(count_include_pad=True)`
 
-### DD-002 — Arm64 Android emulator
+| Model | Sites | pooling share | Runtime delegation | p50 before | p50 after | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Inception V3 | 9 | **46.7%** | 53.3% → 100.0% | 825.18 ms | 424.19 ms | **1.95x** |
+| DenseNet169 | 3 | 4.4% | 95.5% → 99.9% | 343.51 ms | 323.01 ms | 1.06x |
 
-Three timm GhostNet variants, bit-exact (0.000e+00 host and device), median 1.09–1.46x across three runs each; 8 of 9 runs favoured the repaired graph. The same repair on the physical RMX2030 was **inconclusive** — that phone's latency distribution was strongly bimodal (~44 ms and ~600 ms modes), and DelegateDoctor's own gate is what recorded the result as inconclusive rather than as a win.
+Inception V3 is the sharpest illustration of the whole thesis: **97.1% of its
+operators were delegated while only 53.3% of its runtime was**, because nine
+`avg_pool2d` nodes out of 314 operators carried 46.7% of the time.
 
-Full record: [`results/dd002_emulator_validation.md`](results/dd002_emulator_validation.md)
+DenseNet169 matters for a different reason — DD-003 was never written against
+it. Its transition layers hit the zero-padding form of the same rule, where the
+repair is a flag change and no node is added at all.
 
-A recorded end-to-end run, readable without running anything: [`results/example_run.txt`](results/example_run.txt)
+Measurements: [`results/dd003_physical_validation.md`](results/dd003_physical_validation.md)
 
----
+### Healthy and no-repair controls
+
+DelegateDoctor correctly does nothing to these, which is the point.
+
+| Example | Operator delegation | Result |
+| --- | ---: | --- |
+| `fully_delegated/mobilenet_v2.py` | 100.0% | NO REPAIR REQUIRED — no portable hotspots |
+| `fully_delegated/resnext50_32x4d.py` | 100.0% | NO REPAIR REQUIRED — no portable hotspots |
+| `no_repair/convnext_small.py` | 87.9% | NO REPAIR AVAILABLE — fallbacks ranked, no rule matches |
+
+No optimized `.pte` is written for any of them. `convnext_small` is the honest
+negative: DelegateDoctor measured where its time goes and reported that nothing
+in the catalog fits.
 
 ## Repair catalog
 
@@ -158,8 +216,12 @@ Requirements:
 
 - **Python 3.12** (`>=3.12,<3.13` — the bound is deliberate and pip will enforce it)
 - **Android Studio**, with its initial Setup Wizard completed
+- **A physical arm64-v8a Android phone** with USB debugging enabled
 
-Android Studio's Setup Wizard is the one manual Android prerequisite. It installs the SDK that DelegateDoctor discovers via `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the standard install location for your platform. DelegateDoctor does not install an SDK of its own.
+DelegateDoctor measures on a real phone and only on a real phone. Android
+Studio's Setup Wizard is the one manual prerequisite: it installs the SDK that
+DelegateDoctor discovers via `ANDROID_HOME`, `ANDROID_SDK_ROOT`, or the standard
+install location for your platform. DelegateDoctor never installs an SDK itself.
 
 ### macOS on Apple Silicon
 
@@ -187,77 +249,76 @@ delegate-doctor check
 delegate-doctor setup-android
 ```
 
-### Which hosts are supported
-
-Your host architecture and your Android target architecture are separate things. DelegateDoctor always measures on an **arm64-v8a Android target**; the host only decides whether a *useful emulator* is available.
-
-| Host | Arm64 emulator | Notes |
-| --- | --- | --- |
-| macOS on Apple Silicon | Supported and validated | arm64-v8a system images run natively. All emulator evidence in this README was measured here. |
-| Windows or Linux on Arm64 | Implemented, **not validated** | Could in principle run arm64-v8a natively. DelegateDoctor has unit tests for the host-detection path, but it has never been exercised on real hardware. Prefer a physical device. |
-| Any x86_64 host | Not available | An arm64-v8a image would be emulated instruction by instruction, so its latency would measure the emulation rather than Arm. DelegateDoctor refuses to provision an x86_64 emulator and call it an Arm target. Connect a physical arm64-v8a device. |
-
-A physical arm64-v8a Android device works from any host.
+macOS on Apple Silicon is the configuration every measurement in this README was
+produced on. The Windows Arm64 path is implemented and unit-tested — including
+the `platform-tools\adb.exe` layout — but has never been exercised on real
+hardware. The phone is what must be arm64-v8a; the host only has to run Python
+and the NDK toolchain.
 
 ### What the two setup commands do
 
-`delegate-doctor check` is a fast local preflight. It reports your Python version, PyTorch, ExecuTorch, NumPy, pandas, the ETDump analysis path, `adb`, and the Android SDK, with a remedy for anything missing. It touches no network, no device and no API key.
+`delegate-doctor check` is a fast local preflight: Python, PyTorch, ExecuTorch,
+NumPy, pandas, the ETDump analysis path, `adb`, and the Android SDK, with a
+remedy for anything missing. It touches no network, no device and no API key.
 
-`delegate-doctor setup-android` provisions the Arm side for a **physical phone**, which is the fast path: it reuses the SDK Android Studio installed, adds `platform-tools` and the pinned NDK 27.2.12479018, cross-compiles the two ExecuTorch runner binaries, and then checks whether an arm64-v8a device is attached. It does **not** download the Arm64 emulator system image. Your own AVDs and Android Studio settings are never modified.
+`delegate-doctor setup-android` provisions the Arm side: it reuses the SDK
+Android Studio installed, adds `platform-tools` (adb) and the pinned NDK
+27.2.12479018, cross-compiles the two ExecuTorch runner binaries, and checks
+whether an arm64-v8a phone is attached. Nothing else is downloaded — there is no
+emulator, no AVD and no Android system image.
 
-You do not need `adb` on your PATH. DelegateDoctor resolves it from the SDK it discovered — `<sdk>/platform-tools/adb` — and falls back to PATH only if the SDK has none. Android Studio does not put adb on PATH, and a tool that assumed otherwise would report "no device" on a machine with a phone plugged in.
+**You do not need `adb` on your PATH.** DelegateDoctor resolves it from the SDK
+it discovered (`<sdk>/platform-tools/adb`), falling back to PATH only if the SDK
+has none. Android Studio does not put adb on PATH, and a tool that assumed
+otherwise would report "no device" on a machine with a phone plugged in.
 
-### Connect a phone
+### Connect the phone
 
-With a physical device, `setup-android` finishes with:
+Enable Developer options and USB debugging, connect over USB, and accept the
+authorization prompt when it appears. Setup then finishes with:
 
 ```
 Arm64 device            PASS    RMX2030 · arm64-v8a
 
 Physical-device environment READY
 
-    delegate-doctor optimize model.py --target device
+    delegate-doctor optimize model.py
 ```
 
-Enable Developer options and USB debugging on the phone, then accept the authorization prompt when it appears. If the phone shows as `UNAUTHORIZED` or `OFFLINE`, setup says so specifically rather than reporting it as missing.
+If the phone is attached but not ready, setup says which it is —
+`UNAUTHORIZED` (accept the prompt on the phone) or `OFFLINE` (reconnect) —
+rather than reporting it as missing. If adb itself cannot be found, it says
+that instead, because that is a different problem.
 
-### No Android phone?
-
-Setup still succeeds without one — the common environment is what the runner build needs. To measure without a phone, create DelegateDoctor's managed Arm64 emulator on a supported Arm64 host:
-
-```bash
-delegate-doctor setup-android --emulator
-```
-
-This additionally installs the `emulator` package, the pinned platform (API 35) and `system-images;android-35;google_apis;arm64-v8a`, then creates the `DelegateDoctor_ARM64` AVD. **The system image is a large download and takes significantly longer than physical-device setup** — expect several gigabytes and several minutes. Host support is checked before anything is downloaded, so an x86_64 host is told immediately rather than after the wait.
+Setup succeeds without a phone too: the runners are built either way, and the
+missing phone is reported as the next step rather than as a failure.
 
 ---
 
 ## Run your first model
 
-A model that is already fully delegated — nothing to repair, and the analysis still tells you so:
+A model that is already fully delegated — nothing to repair, and the analysis
+still tells you so:
 
 ```bash
-delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py --target emulator
+delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py
 ```
 
 A model with a large, repairable fallback:
 
 ```bash
-delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulator
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py
 ```
 
-The first reports high runtime delegation and no repair required. The second finds nine `avg_pool2d` fallbacks worth about 60% of runtime, repairs them in one candidate, verifies it, benchmarks it, and writes an optimized `.pte`.
+The first reports 100% runtime delegation and no repair required. The second
+finds nine `avg_pool2d` fallbacks worth about 47% of runtime, repairs them in
+one candidate, verifies it on host and phone, benchmarks it, and writes an
+optimized `.pte`.
 
-`mobilenet_v2.py` uses random weights and needs no network. `inception_v3.py` downloads a pretrained checkpoint on its first run, because the recorded DD-003 numbers were measured with it.
+Both run offline: every example uses random weights.
 
-With a phone attached, use `--target device`:
-
-```bash
-delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target device
-```
-
-`--target emulator` measures on the managed emulator instead, and `--target auto` lets DelegateDoctor choose — preferring a physical device when both are present.
+With several phones attached, pick one with `--device SERIAL`; with one, it is
+selected automatically.
 
 ---
 
@@ -282,7 +343,7 @@ def delegate_doctor_inputs():
 ```
 
 ```bash
-delegate-doctor optimize model.py --target emulator
+delegate-doctor optimize model.py
 ```
 
 That is the whole contract. With those two functions present, preparation is fully deterministic and no AI is involved at any point.
@@ -318,22 +379,24 @@ The CLI path is the recommended way to reproduce this project's results, because
 
 ---
 
-## Physical Android device
-
-Check that a device is attached and reports the right ABI:
+## Choosing among several phones
 
 ```bash
-adb devices
-adb shell getprop ro.product.cpu.abi
+adb devices                                  # if adb is on your PATH
+delegate-doctor check --verbose              # otherwise: shows the adb it resolved
 ```
 
-The second command must print `arm64-v8a`. Then:
+With one phone attached it is selected automatically. With several, DelegateDoctor
+asks — or, in a `--non-interactive` run, takes the first and tells you to use
+`--device`:
 
 ```bash
-delegate-doctor optimize model.py --target device
+delegate-doctor optimize model.py --device SERIAL
 ```
 
-With several devices attached, pick one with `--device SERIAL`. Every report records the exact target it measured on, and emulator and physical-device results are labelled distinctly, so the two are never confused after the fact.
+Every report records the phone it measured on — model, ABI, Android version —
+so a result can never be confused with one from a different device. The adb
+serial is not written into shareable reports.
 
 ---
 
@@ -408,13 +471,13 @@ Grouped by what they demonstrate. All but one declare the DelegateDoctor model i
 **DD-001 — non-last-dimension softmax**
 
 ```bash
-delegate-doctor optimize examples/dd001_softmax/interface_mnist.py --target emulator
-delegate-doctor optimize examples/dd001_softmax/unet.py --target emulator
-delegate-doctor optimize examples/dd001_softmax/unetplusplus.py --target emulator
-delegate-doctor optimize examples/dd001_softmax/fpn.py --target emulator
-delegate-doctor optimize examples/dd001_softmax/pspnet.py --target emulator
-delegate-doctor optimize examples/dd001_softmax/deeplabv3plus.py --target emulator
-delegate-doctor optimize examples/dd001_softmax/linknet.py --target emulator
+delegate-doctor optimize examples/dd001_softmax/interface_mnist.py
+delegate-doctor optimize examples/dd001_softmax/unet.py
+delegate-doctor optimize examples/dd001_softmax/unetplusplus.py
+delegate-doctor optimize examples/dd001_softmax/fpn.py
+delegate-doctor optimize examples/dd001_softmax/pspnet.py
+delegate-doctor optimize examples/dd001_softmax/deeplabv3plus.py
+delegate-doctor optimize examples/dd001_softmax/linknet.py
 ```
 
 `interface_mnist.py` is the smallest — a handful of layers, no model library, fastest to run first.
@@ -422,27 +485,27 @@ delegate-doctor optimize examples/dd001_softmax/linknet.py --target emulator
 **DD-002 — redundant alias**
 
 ```bash
-delegate-doctor optimize examples/dd002_alias/ghostnet.py --target emulator
+delegate-doctor optimize examples/dd002_alias/ghostnet.py
 ```
 
 **DD-003 — avg_pool2d padding**
 
 ```bash
-delegate-doctor optimize examples/dd003_avgpool/inception_v3.py --target emulator
-delegate-doctor optimize examples/dd003_avgpool/densenet169.py --target emulator
+delegate-doctor optimize examples/dd003_avgpool/inception_v3.py
+delegate-doctor optimize examples/dd003_avgpool/densenet169.py
 ```
 
 **Already fully delegated** — the healthy case, where the useful output is the analysis
 
 ```bash
-delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py --target emulator
-delegate-doctor optimize examples/fully_delegated/resnext50_32x4d.py --target emulator
+delegate-doctor optimize examples/fully_delegated/mobilenet_v2.py
+delegate-doctor optimize examples/fully_delegated/resnext50_32x4d.py
 ```
 
 **Fallbacks with no known repair** — an honest negative result
 
 ```bash
-delegate-doctor optimize examples/no_repair/convnext_small.py --target emulator
+delegate-doctor optimize examples/no_repair/convnext_small.py
 ```
 
 **A model file with no interface** — `examples/ai_adapter/densenet121.py` deliberately declares neither `delegate_doctor_model()` nor `delegate_doctor_inputs()`. It exists to demonstrate the case optional AI preparation handles; see below.
@@ -479,7 +542,7 @@ export DELEGATE_DOCTOR_LLM_API_KEY="..."
 **This is an experimental, opt-in feature. It is off by default and is not required to use DelegateDoctor.** Everything above works without it.
 
 ```bash
-delegate-doctor optimize model.py --target emulator --ai-repair
+delegate-doctor optimize model.py --ai-repair
 ```
 
 Without `--ai-repair`, no provider is contacted and no proposal is requested, whatever the profile shows.
@@ -507,26 +570,24 @@ This repository contains no measured evidence of an accepted AI repair. The dete
 
 - **ExecuTorch is pinned** to 1.4.0, commit `3dd7ccd1d863fad22639dd2d918ae34a41ce45f0`, which is what `setup-android` checks out and builds. `executorch==1.4.0` pulls torch 2.13.0 itself.
 - **Two runner binaries, never merged.** `executor_runner_etdump` has the event tracer compiled in and is used only for profiling; `executor_runner_bench` has it off and is used only for timing. A single instrumented binary would quietly tax every latency measurement.
-- **The Arm target is recorded** in every report — model, ABI, Android version, thread count, and whether it was an emulator.
-- **Benchmarks are interleaved.** Default 20 warmup + 150 measured iterations x 3 repetitions, before and after alternating within each repetition, identical input bytes and thread count. p50 is reported, not the mean. Tunable with `--warmup`, `--iters`, `--reps`, `--threads`.
+- **The phone is recorded** in every report — model, ABI, Android version and thread count. The adb serial is not.
+- **Benchmarks are interleaved.** Default 5 warmup + 20 measured iterations x 1 repetition, before and after alternating, identical input bytes and thread count. p50 is reported, not the mean. These are single-run measurements, chosen so the whole example suite can be covered on an older handset; raise them with `--warmup`, `--iters`, `--reps` when you want depth on one model.
 - **Device verification is a separate, untimed invocation** that writes output tensors; the timed benchmark writes none.
 
 <details>
 <summary>What <code>setup-android</code> installs</summary>
 
-Into the SDK Android Studio already installed. Plain `setup-android`:
+Into the SDK Android Studio already installed:
 
 - `platform-tools` (adb)
 - `ndk;27.2.12479018`
 
-With `--emulator`, additionally:
+That is the whole list. There is no emulator package, no SDK platform and no
+Android system image, because DelegateDoctor measures on a real phone.
 
-- `emulator`
-- `platforms;android-35`
-- `system-images;android-35;google_apis;arm64-v8a` — the large one
-- an AVD named `DelegateDoctor_ARM64`, only where the host can run arm64-v8a natively
-
-Either way it then fetches the pinned ExecuTorch commit into `.build/` and cross-compiles the two runners into `runners/`. Both directories are git-ignored. `--rebuild` forces a rebuild and `--jobs N` controls compile parallelism. (`--skip-emulator` still parses, but the emulator is now opt-in, so it is the default.)
+It then fetches the pinned ExecuTorch commit into `.build/` and cross-compiles
+the two runners into `runners/`. Both directories are git-ignored. `--rebuild`
+forces a rebuild and `--jobs N` controls compile parallelism.
 
 </details>
 
@@ -539,7 +600,7 @@ python -m pip install -e ".[dev,examples]"
 python -m pytest tests/ -q
 ```
 
-1267 tests. The suite is fully offline: no Android device, no emulator, no NDK, no network and no API key. Device mechanisms are mocked; `torch.export`, lowering and the repair rules run for real.
+The suite is fully offline: no Android device, no NDK, no network and no API key. Device mechanisms are mocked; `torch.export`, lowering and the repair rules run for real.
 
 ---
 
@@ -548,7 +609,8 @@ python -m pytest tests/ -q
 - **ExecuTorch + XNNPACK only.** This is the one deployment path DelegateDoctor understands. Other backends and other runtimes are out of scope.
 - **The repair catalog is small** — three rules. A model whose fallbacks are not among them gets analysis and an honest "no known repair", which is a real answer but not a faster model.
 - **A device is required to accept a repair.** Correctness and speed are both measured on the target, so without one you get static analysis only.
-- **Emulator performance is not handset performance.** Arm64 code runs natively on an Apple Silicon host, but cache sizes, memory bandwidth and scheduling differ from a phone. Emulator numbers demonstrate direction and magnitude, not handset latency.
+- **A physical arm64-v8a phone is required.** There is no emulator path. Without a phone you get static analysis — export, lowering and delegation — but no profiling, no verification, no benchmark and therefore no accepted repair.
+- **The published numbers are single runs on one older handset.** They show direction and magnitude on that device; another phone will differ, which is exactly why DelegateDoctor benchmarks on yours rather than quoting these.
 - **Device verification reads the first output tensor**, as fp32. A model with several outputs is still analyzed and benchmarked; its device verification is marked unsupported rather than guessed at.
 - **Python 3.12 only**, and ExecuTorch 1.4.0 exactly. Both bounds are enforced by the packaging, so a mismatch is a clear error rather than a subtly different environment.
 - **No `.pte` entry point.** DelegateDoctor repairs the exported graph, and a `.pte`'s delegated regions are already compiled blobs. Point it at the PyTorch model instead.

@@ -1,6 +1,6 @@
 """Suite-wide guarantees: no device, no browser, no network.
 
-The test suite must produce the same result on a laptop with an Arm64 emulator
+The test suite must produce the same result on a laptop with a phone plugged in
 running as on a CI box with no `adb` at all. Without this, tests silently reach
 whatever happens to be plugged in - which is exactly the kind of environmental
 dependency that makes a suite untrustworthy.
@@ -11,7 +11,7 @@ do it inside the test, their patch wins over the autouse fixture here.
 
 import pytest
 
-from delegate_doctor import device, emulator, result, target_selection
+from delegate_doctor import android_packages, device, result, target_selection
 from delegate_doctor.agent import client as ai_client
 
 
@@ -38,20 +38,16 @@ def no_real_android_device(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_real_android_tooling(monkeypatch):
-    """No test may run sdkmanager, avdmanager or the emulator.
+    """No test may run sdkmanager.
 
-    `run_tool` is the single choke point for every Android SDK command, and
-    `launch_emulator_process` is the only way an emulator is ever started, so
-    blocking both means a stray test cannot download an SDK package, create an
-    AVD, or boot a virtual device.
+    `run_tool` is the single choke point for every Android SDK command, so
+    blocking it covers package inspection, installation and licences at once.
     """
     def refuse_tool(*args, **kwargs):
-        raise emulator.EmulatorError("Android tooling is blocked by the test suite")
+        raise android_packages.AndroidPackageError(
+            "Android tooling is blocked by the test suite")
 
-    monkeypatch.setattr(emulator, "run_tool", refuse_tool)
-    monkeypatch.setattr(emulator, "launch_emulator_process",
-                        lambda *args, **kwargs: pytest.fail(
-                            "a test tried to start a real emulator"))
+    monkeypatch.setattr(android_packages, "run_tool", refuse_tool)
 
 
 @pytest.fixture(autouse=True)

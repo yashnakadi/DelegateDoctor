@@ -85,8 +85,8 @@ def save_input_for_device(input_tensor: torch.Tensor, run_dir: str,
     return path
 
 
-def _find_device(runners_dir: str, target_preference: str = "auto",
-                 target_serial: str = None, interactive: bool = False):
+def _find_device(runners_dir: str, target_serial: str = None,
+                 interactive: bool = False):
     """Choose the Arm target and locate both runners, without raising.
 
     A missing device is a missing *capability*, not a broken model, so it is
@@ -98,7 +98,6 @@ def _find_device(runners_dir: str, target_preference: str = "auto",
     """
     try:
         target = target_selection.select_target(
-            preference=target_preference,
             serial=target_serial,
             interactive=interactive,
             announce=lambda *args, **kwargs: None,
@@ -115,15 +114,19 @@ def run_optimization(
     model_spec,
     runners_dir: str = DEFAULT_RUNNERS_DIR,
     artifacts_dir: str = DEFAULT_ARTIFACTS_DIR,
-    warmup_iterations: int = 20,
-    measured_iterations: int = 150,
-    repetitions: int = 3,
+    # Lightweight on purpose. The validation phone is an older handset and the
+    # example suite covers a dozen architectures, so the defaults favour
+    # covering the suite over per-model statistical depth. One repetition means
+    # a single measured run, and the reports say so rather than implying a
+    # median across runs.
+    warmup_iterations: int = 5,
+    measured_iterations: int = 20,
+    repetitions: int = 1,
     threads: int = 4,
     profile_iterations: int = 20,
     run_dir: str = None,
     verbose: bool = False,
     quiet: bool = False,
-    target_preference: str = "auto",
     target_serial: str = None,
     interactive: bool = False,
     # Experimental AI repair is opt-in. Without it the pipeline stops after
@@ -157,7 +160,6 @@ def run_optimization(
             run_dir=run_dir,
             verbose=verbose,
             quiet=quiet,
-            target_preference=target_preference,
             target_serial=target_serial,
             interactive=interactive,
             ai_repair=ai_repair,
@@ -178,7 +180,6 @@ def _run_analysis(
     run_dir: str,
     verbose: bool,
     quiet: bool,
-    target_preference: str,
     target_serial: str,
     interactive: bool,
     ai_repair: bool,
@@ -278,11 +279,9 @@ def _run_analysis(
 
     # --- target and tooling, if any ----------------------------------------
     device_info, bench_runner, etdump_runner, device_reason = _find_device(
-        runners_dir, target_preference=target_preference,
-        target_serial=target_serial, interactive=interactive)
+        runners_dir, target_serial=target_serial, interactive=interactive)
     if device_info is not None:
         outcome.device_description = device_info.short_description()
-        outcome.device_is_emulator = device_info.is_emulator
 
     emit(reporting.format_header(
         model_name=model_spec.name,

@@ -166,7 +166,6 @@ class OptimizationResult:
 
     # the Arm target that produced any measurement here, if one did
     device_description: str = ""
-    device_is_emulator: bool = False
 
     # Rule id -> {"title", "rewrite"}, copied from the catalog so the report can
     # describe a repair without importing the rules or knowing what they are.
@@ -324,7 +323,6 @@ class OptimizationResult:
             "ai_candidate_count": self.ai_candidate_count,
             "ai_attempt_summaries": list(self.ai_attempt_summaries),
             "device": self.device_description,
-            "device_is_emulator": self.device_is_emulator,
             "run_dir": self.run_dir,
             "output_pte": self.output_pte,
             "report_path": self.report_path,

@@ -269,12 +269,6 @@ def test_the_target_is_named():
     assert "Measured on device" in text
 
 
-def test_an_emulator_target_stays_labelled():
-    outcome = accepted_result()
-    outcome.device_is_emulator = True
-    text = visible_text(render(outcome))
-    assert "Measured on emulator" in text
-    assert "not handset numbers" in text
 
 
 def test_the_repair_diagram_comes_from_rule_metadata():
